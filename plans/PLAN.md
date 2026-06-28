@@ -54,7 +54,9 @@ and handed over the decisions below. They are accepted as the foundation.
 | The category ENUM + its plist codegen | — | ✅ (240 values, app-specific) |
 | One-call bootstrap + idempotency + preConfigLogs replay | ✅ | — |
 | `effectiveLevel` accessor + change callback | ✅ | ✅ pushes to closed SDKs |
-| Closure-handler bridge (LogDriver/SwiftToolbox) | ✅ adapter shape | ✅ installs it |
+| Dynamic-level entry `custom(level:)` (closure path) | ✅ | ✅ calls it from its closure |
+| Routing existing closures in | ✅ doc/pattern only (no type) | ✅ app closure calls the public API |
+| Eager thread capture (`ThreadKind`) | ✅ at construction | — |
 | Log directory path (per process) | — | ✅ (param) |
 | Per-destination level / category include-exclude / force-include | ✅ mechanism | ✅ config |
 | Which logger labels + metadata + category to attach | — | ✅ |
@@ -122,11 +124,51 @@ filter key, an optional wire-format field, and the OSLog `category:`. See §3.1a
 ## 3. Components
 
 ### 3.1 `LogRecord` (value type)
-Immutable struct produced once per log call (eagerly, on the calling thread) and shared (by value)
-to every destination: `timestamp: Date`, `level: Logger.Level`, `label: String`,
-**`category: LogCategory`**, `message: String`, `metadata: [String: String]` (already flattened +
-sanitized — see §4), plus source attribution (`file/function/line`). Sendable. Sanitization
-(newline/control-char stripping) happens **here, once**, so destinations never re-sanitize.
+Immutable, `Sendable` struct produced once per log call (eagerly, on the calling thread) and shared
+(by value) to every destination. Fields:
+- `timestamp: Date`, `level: Logger.Level`, `label: String`, **`category: LogCategory`**,
+  `message: String`, source attribution (`file/function/line`).
+- **`thread: ThreadKind`** (Finding 1) — `.main` / `.background`, sampled via `Thread.isMainThread`
+  **at construction on the calling thread**. This MUST be captured eagerly: by the time a
+  destination's serial queue formats the record, the thread identity is gone/wrong. Muse renders it
+  `[UI]`/`[BG]` in both the file line and the OSLog line; rendering it is a per-destination format
+  option, but the *capture* is non-negotiably eager. (Test: a record built on main formats `[UI]`
+  even though the destination writes it from a background queue.)
+- **`metadata`: the structured bag, rendered ONCE to a Sendable logfmt fragment** (Finding 2 — see
+  §3.1b). NOT a re-flattenable `[String: String]` map.
+
+Sanitization (newline/control-char stripping, gotcha D) happens **here, once**, applied recursively
+to the structured metadata while rendering its fragment, so destinations never re-sanitize and the
+`Any?` bag never crosses a queue/Sendable boundary (reconciles with §4.2).
+
+### 3.1b Metadata model (Finding 2 — the one place the wire format could silently change)
+Muse's real context is `[String: Any?]`, NOT `[String: CustomStringConvertible]`: it has **nil
+values** (logged as a literal marker, not dropped), **nested dictionaries AND arrays** (e.g.
+`Error.loggingContext()` → `["underlying_errors": [[…],[…]], "domain": …, "code": Int]`), and
+**self-rendering typed values** via `CustomLogfmtStringConvertible` (`QualifiedId`/`SnowflakeId` →
+`hexString`), plus `Bool/Int/Double/CGFloat`. A flattened `[String: String]` cannot express nil or
+nesting, and re-serializing a flattened map would create a **second, divergent flattening path**
+that drifts from `String.logfmt`.
+- **Rule: there is exactly ONE metadata rendering path — `String.logfmt` from the adamwulf/Logfmt
+  package** (which already owns dot-flattening of nested dicts, array handling, nil rendering, and
+  the `CustomLogfmtStringConvertible`/`Loggable` typed-value machinery). Both producers route through
+  it: the **closure bridge** hands Muse's `[String: Any?]` straight to `String.logfmt`, and the
+  **convenience sugar** (§3.9, Nit A) uses the same `[String: Any?]` + same renderer — never a
+  separate one.
+- **Where it renders:** eagerly on the calling thread (where the `[String: Any?]` bag is local), the
+  bag is rendered to its sanitized logfmt key=value fragment, and `LogRecord` carries that **string
+  fragment** (Sendable). This keeps the bag off the queue boundary (Swift-6 clean) AND guarantees
+  byte-identical output to Muse today (single renderer). The per-destination format variation is in
+  the **leading scalar fields** (ts/level/label/category/thread/source/msg) + which appear, not in
+  how the metadata serializes — so rendering the metadata fragment once is safe.
+  - **ASSUMPTION to confirm with muse-log-helper:** no destination needs to render a *subset* of
+    metadata keys or serialize the bag differently (the memory viewer "re-filters" by
+    level/category/text over the rendered line, it doesn't re-serialize metadata). If a destination
+    DID need per-key metadata selection, `LogRecord` would instead carry the structured bag wrapped
+    in a `Sendable` box rendered lazily — heavier; only if required.
+- **Test:** `Error.loggingContext()` with nested `underlying_errors` (array of dicts) + a nil value
+  + a `CustomLogfmtStringConvertible` id renders **identically** through the bridge as through Muse's
+  current `String.logfmt` path.
 
 ### 3.1a `LogCategory` (first-class routable field — muse-ios requirement)
 A lightweight wrapper over `String` (`struct LogCategory: Hashable, Sendable,
@@ -136,7 +178,9 @@ enum — Muse codegen's its ~240-value enum from a plist; the app maps it in by 
 - **Destination routing key:** per-destination include-set / exclude-set are sets of `LogCategory`.
   A typed field means filters are set membership, not hot-path dict-lookup-then-string-compare.
 - **Optional wire-format field:** destinations may render `category=…` in their line.
-- **OSLog `category:`** for the console/OSLog destination (subsystem = app-supplied).
+- **OSLog `category:`** for the console/OSLog destination: one `os.Logger(subsystem: <constant app
+  bundle id>, category: record.category.rawValue)`, cached per category (Muse builds ~240 once). Keyed
+  on `record.category`, NOT `record.label` (Nit B) — this is how Console.app filtering works for Muse.
 
 It must be cheap to omit: a `Logger`-only consumer that never supplies a category gets a default
 (e.g. derived from `label`, or a sentinel `.default`), so the swift-log-direct path is unaffected.
@@ -220,12 +264,16 @@ timestamp; the snapshot file is a second instance with its own include-set).
     bounded to one record.
   - `.dateStamped` (DATE-IN-FILENAME — Muse's real model, corrected from "minute" per Q-E): the
     active filename embeds the date, e.g. `Muse-App-2026-06-27.log` (`yyyy-MM-dd`, **UTC**). Rotation
-    = **roll at the UTC day boundary**, detected by a cheap **poll-and-swap** (Muse polls ~1/min and
-    recomputes today's filename; if it changed since last write, swap to the new file). The 1-min
-    cadence is just the poll, NOT the boundary — the boundary is UTC midnight. Poll-and-swap means a
-    launch the next day opens a fresh dated file even if the process wasn't alive at midnight. No
-    numbered siblings; pruning is purely age-based over the dated files. Granularity is parameterized
-    (`.day` for Muse; could support `.hour`) but the alignment is **calendar**, not interval.
+    = **roll at the UTC day boundary**, detected by **computed-filename-differs**, not a midnight timer.
+    - **No mandatory internal timer (Nit C).** The destination checks "does today's computed filename
+      differ from the open file's name?" cheaply **on every `receive()`** (format a Date, compare a
+      string) and swaps if so — so the **next write after midnight rolls naturally**, and a cold launch
+      the next day opens the fresh dated file on first write. It also exposes an **idempotent
+      `rollIfDateChanged()`** the APP may call on any cadence (Muse pokes it ~1/min as
+      belt-and-suspenders for a process that's idle across midnight). Cadence is the app's choice; the
+      package does not own a Timer.
+    - No numbered siblings; pruning is purely age-based over the dated files. Granularity is
+      parameterized (`.day` for Muse; could support `.hour`) but the alignment is **calendar**.
 - **Pruning**: enforce max rotated-file count and/or max age, **never deleting the active
   file** (APFS keeps an unlinked-but-open file alive only for its holder → silent writes into
   an unreachable inode → data loss). Skip `activeURL` in the prune sweep (gotcha E). Pruning
@@ -258,9 +306,11 @@ formatted lines) so the in-app viewer can re-filter and render lazily with its o
 
 ### 3.6 `ConsoleDestination` (Q2 — decided)
 Dev-time visibility. Expose a **`ConsoleMode` enum: `.osLog` (default) / `.stderr` / `.none`**.
-- `.osLog` (default on Apple platforms): write a small `OSLogDestination` that maps `label →
-  subsystem/category` and emits the **same formatted logfmt line** at the mapped os level. This
-  is a genuinely better default than stderr when consumers live in Xcode/Console.app — proper
+- `.osLog` (default on Apple platforms): write a small `OSLogDestination` that emits the
+  **same formatted logfmt line** at the mapped os level via an `os.Logger` cached **per
+  `record.category`** (subsystem = a constant app bundle id; category = `record.category.rawValue`,
+  NOT `label` — Nit B). Muse pre-builds ~240 such loggers; we cache lazily on first use per category.
+  This is a genuinely better default than stderr when consumers live in Xcode/Console.app — proper
   level coloring, subsystem/category filtering, shows in the unified log.
   - **Gotcha:** `os_log` redacts interpolated values as `<private>` by default. Emit the line
     with `privacy: .public` (`%{public}s`) — safe because we control + already sanitize the
@@ -336,36 +386,48 @@ swift-log's native metadata API is verbose. Add ergonomic helpers:
 ```
 log.info("wrote", ["bytes": n, "path": url])     // vs swift-log's .stringConvertible boilerplate
 log.debug(…) / log.warning(…) / log.error(…)
+log.custom(level: lvl, …)                        // DYNAMIC level — required by the closure path (§3.10)
 ```
-- Take a plain `[String: CustomStringConvertible]` bag; bridge each value to
-  `.stringConvertible` via a tiny `Sendable` wrapper that captures `.description` **eagerly**.
+- **Dynamic-level entry (required):** alongside the four fixed-level helpers, expose
+  `custom(level:category:_:metadata:file:function:line:)` taking `level` as a runtime value. This is
+  what an app's existing closure-based logger calls from inside its closure (the closure receives
+  `level` at runtime). Mirrors Muse's `log.custom(level:…)`. Without it, the only dynamic-level path
+  is swift-log's `Logger.log(level:_:metadata:source:)` — fine, but the sugar should offer parity.
+- All helpers also accept an optional `category:` so the closure path can supply it.
+- Take a `[String: Any?]` bag rendered through the **same `String.logfmt` path** as the closure
+  bridge (Nit A) — NOT a separate `[String: CustomStringConvertible]` renderer. One renderer for
+  both producers means the sugar and the bridge can't drift (the in-miniature version of Finding 2).
+  This keeps nil values, nesting, and `CustomLogfmtStringConvertible` typed values working in the
+  sugar too. Values are rendered eagerly on the calling thread (so the `Any?` bag stays local and
+  Sendable-clean per §4.2).
 - Forward `file/function/line` so source attribution survives.
 - **Additive** on the real `Logger` — not a replacement type.
 
-### 3.10 Closure-handler bridge (muse-ios Finding #2 — corrects an earlier assumption)
+### 3.10 Routing existing closure-based loggers in (doc note — NOT a shipped type)
 **Today LogDriver and SwiftToolbox do NOT use swift-log** — they emit through an app-installed
-closure (`LogDriver`'s `LogContext.logHandler = { level, msg, file, func, line, context in … }`,
-SwiftToolbox's `SwiftToolbox.logHandler = { … }`). So FellerBuncher must support **both** integration
-paths, not assume native swift-log:
-- **(a) Closure-in bridge (day-one, zero change to those packages):** a small adapter the app
-  installs into those closures that builds a `LogRecord` (re-leveling into our levels, mapping their
-  args to label/category/metadata) and feeds the registry — exactly what Muse's facade does today.
-  FellerBuncher ships this adapter shape so the existing closures keep working unchanged.
-- **(b) Native swift-log client (migration target):** a package that adopts `Logger(label:)` flows
-  in natively via the handler. Cleaner long-term, but it's a change to LogDriver/SwiftToolbox (both
-  Adam's), out of scope for FellerBuncher itself.
-Design rule: the **`LogRecord` + registry is the real ingestion point**; the swift-log `LogHandler`
-is just *one* producer of records. The closure bridge is another producer. Don't couple ingestion
-to swift-log exclusively.
+closure (`LogContext.logHandler = { level, msg, file, func, line, context in … }`,
+`SwiftToolbox.logHandler = { … }`). The same is true of the closed SDKs (Setapp/Sparkle) and the
+Sentry error path.
 
-**This multiple-producers shape is UNCONDITIONAL** (confirmed by muse-log-helper) — it ships day-one
-regardless of whether LogDriver/SwiftToolbox ever migrate to native swift-log, because other closure
-producers exist permanently: the closed-source SDKs (Setapp, Sparkle) slave their level to ours via
-their own setters, and the Sentry error path is fed the same way. The closure bridge is **not
-build-to-discard**; it stays for the closed SDKs even after the two in-house packages go native. So:
-build registry-with-co-equal-producers now; the only open scope question (Adam's call) is *when*
-LogDriver/SwiftToolbox migrate, which only moves tasks between this effort and a follow-up — it does
-not change the architecture.
+**Decision (Adam): there is NO `ClosureHandlerBridge` package TYPE — it was over-engineering.**
+To route an existing closure-based logger into FellerBuncher, the **app's own closure body calls
+FellerBuncher's public log entry point directly** — mapping the runtime `level`, supplying a
+`category`, and handing `context` as the metadata bag — exactly as Muse's facade does today. That's
+app code calling a public API; the package ships no dedicated "receiver" type. (Bonus: the eager
+on-calling-thread capture of thread identity + metadata render happens naturally, because the app's
+closure call site *is* the calling thread.)
+
+The **multiple-producers mental model still holds** (a closure is a producer of records), but the
+producer is plain app code, not a package type. So the **only** API affordance this requires:
+- **A DYNAMIC-LEVEL public log entry** — the closure receives `level` as a runtime value, so the
+  fixed-level `.debug/.info/.warning/.error` sugar is not enough on its own. Provide a
+  `custom(level:category:_:metadata:…)` variant (mirrors Muse's `log.custom(level:…)`), or document
+  using swift-log's `Logger.log(level:_:metadata:source:)` directly. This is the one thing the
+  dropped bridge type was implicitly providing → see §3.9.
+
+Scope (Adam, Path A): Muse migrates its call sites onto FellerBuncher over time; **LogDriver/
+SwiftToolbox migrate to native swift-log LATER, separately** — no package-migration tasks in this
+effort. Architecture is unchanged either way.
 
 ### 3.11 Non-file destinations as proof the design generalizes (muse-ios Finding #3b)
 Muse forks **error-level** records to **Sentry** (`SentrySDK.capture`) with typed context mapped
@@ -424,9 +486,11 @@ per-source token-bucket predicate slots in as a filter stage — noted, not buil
 This is a fresh reusable package, so target **Swift 6 language mode / `-strict-concurrency=complete`
 from the start** — do NOT inherit log-helper's 5.9-no-strict baseline (the one place their package
 is behind where ours should be). The two friction points and their fixes (from log-helper):
-- **(a) The `[String: Any]` logfmt bag** in `format(...)` is not Sendable. Keep it strictly **local**:
-  build and consume it inside the one synchronous function, and pass only the **already-formatted
-  `String`** (Sendable) into `write()`. Never let the `Any` bag escape into the `queue.async` closure.
+- **(a) The `[String: Any?]` metadata bag** is not Sendable. Render it to its sanitized logfmt
+  fragment **eagerly on the calling thread** (where it's local) and have `LogRecord` carry that
+  **Sendable string fragment** (§3.1b), never the bag. The leading scalar fields stay structured for
+  per-destination formatting, but they're all Sendable value types. So the `Any?` bag is consumed
+  before any `queue.async` boundary and never crosses it — Swift-6 clean by construction.
 - **(b) `ISO8601DateFormatter` is not Sendable**, so a `static let` of it warns under complete
   checking. **Use `Date.ISO8601FormatStyle` instead** (a Sendable value type) — it sidesteps the
   warning entirely and is the right choice when targeting Swift 6 from day one. (Fallback only if a
@@ -444,17 +508,17 @@ Package.swift                       # swift-log + adamwulf/Logfmt deps; FellerBu
 Sources/FellerBuncher/
   FellerBuncher.swift               # bootstrap() -> LoggingHandle + public config types
   LoggingHandle.swift               # control surface: add/removeDestination, effectiveLevel, drain
-  LogRecord.swift                   # value type; sanitized once; carries category + source
+  LogRecord.swift                   # value type; sanitized once; category + ThreadKind + source + rendered-metadata fragment
   LogCategory.swift                 # first-class routable field (String wrapper, app maps its enum)
-  LogfmtFormatter.swift             # per-destination CONFIG (ts style, level style, fields)
+  LogfmtFormatter.swift             # per-destination CONFIG (ts style, level style, thread, fields); ONE metadata renderer via String.logfmt
   LogDestination.swift              # protocol (level + category include/exclude + force-include)
   DestinationRegistry.swift         # runtime-mutable, lock-guarded fan-out target
-  FileDestination.swift             # serial queue; pluggable RotationPolicy (.size/.dateStamped); prune
+  FileDestination.swift             # serial queue; pluggable RotationPolicy (.size/.dateStamped, app-poked rollIfDateChanged); prune
   MemoryDestination.swift           # ring buffer 5000, O(1) drop-oldest, coalesced onChange
-  ConsoleDestination.swift          # OSLog (category=) / stderr
+  ConsoleDestination.swift          # OSLog (os.Logger cached per CATEGORY) / stderr
   FellerBuncherLogHandler.swift     # swift-log LogHandler: level-gate, build record, fan out
-  ClosureHandlerBridge.swift        # ingest LogDriver/SwiftToolbox closures as records (Finding #2)
-  Logger+Convenience.swift          # ergonomic sugar (debug/info/warning/error + metadata bag)
+  Logger+Convenience.swift          # ergonomic sugar (debug/info/warning/error + custom(level:) + [String:Any?] bag)
+  # NOTE: NO ClosureHandlerBridge type (dropped) — apps route existing closures by calling custom(level:) (§3.10)
   # LogExporter.swift               # DEFERRED (Q5): Foundation-only zip plumbing, no UIKit
   # SentryDestination.swift         # APP-OWNED example, not shipped — proof the protocol generalizes
 Tests/FellerBuncherTests/           # inject temp dir
@@ -472,8 +536,17 @@ plans/PLAN.md                       # this file
   the wire format, or existing logfmt greps/tooling break. (log-helper flagged this as the one place
   the format could drift.)
 - Sanitization: `\r\n` + control chars stripped from message AND every metadata value.
+- **Eager thread capture (Finding 1):** a record built on the **main thread** formats as `[UI]` even
+  when the destination writes it from its **background** queue (proves `Thread.isMainThread` is
+  sampled at construction, not at format time).
+- **Metadata wire-fidelity (Finding 2):** `Error.loggingContext()` with nested `underlying_errors`
+  (array of dicts) + a nil value + a `CustomLogfmtStringConvertible` id renders **identically**
+  through the public entry as through Muse's current `String.logfmt` path (single renderer, no
+  divergent flatten). Also: the sugar (`[String: Any?]`) and the closure path produce the same bytes
+  for the same bag (one renderer, Nit A).
 - **Per-destination format:** two destinations render the same `LogRecord` differently (one ISO8601
-  UTC, one custom local-time padded-level) — verify each formatter config independently (pure func).
+  UTC, one custom local-time padded-level + `[UI]/[BG]` thread) — verify each formatter config
+  independently (pure func).
 - **24-char timestamp constraint:** Muse's `.custom` style emits exactly 24 chars
   `2026-06-27 12:34:56.789` as the leading field (no `ts=` prefix) so the viewer's `0..<24` gray-out holds.
 - `.size` rotation: file rolls at the size threshold; rotated siblings shift correctly.
@@ -493,8 +566,11 @@ plans/PLAN.md                       # this file
   removeDestination drains before teardown.
 - **effectiveLevel:** changing it updates the handler and fires `onEffectiveLevelChange`.
 - Memory destination: ring buffer caps at 5000, O(1) drop-oldest; snapshot in order; coalesced onChange fires.
-- **Closure bridge:** a record built via the closure-handler bridge lands in the registry identically
-  to one from the swift-log handler.
+- **Closure path:** a record produced by calling `custom(level:category:metadata:…)` (as an app's
+  closure would) lands in the registry identically to one from the swift-log handler — and a dynamic
+  `level` passed as a value routes/filters correctly.
+- **OSLog per-category:** the OSLog destination caches one `os.Logger` per `record.category` (not per
+  label); two records with different categories use different loggers.
 - Convenience sugar: metadata bag bridged correctly; file/function/line forwarded.
 
 ---
@@ -522,8 +598,21 @@ plans/PLAN.md                       # this file
 - ✅ **Q-D** Cross-process: collect-at-zip; each process prunes its OWN dir; no cross-dir prune. → §3.4.
 - ✅ **Q-E** Rotation = **UTC calendar-day** dated filename (`Muse-App-yyyy-MM-dd.log`), poll-and-swap
   (1-min poll detects the midnight boundary); minute is the poll, not the boundary. → §3.4 `.dateStamped`.
-- New findings folded: closure-handler bridge (§3.10), Sentry-as-destination proof (§3.11),
-  rate-limit/coalescing app-owned for v1 (§3.12), 24-char timestamp viewer constraint (§3.2).
+- New findings folded: routing-closures-via-public-API doc note (§3.10, NO bridge type — dropped per
+  Adam), Sentry-as-destination proof (§3.11), rate-limit/coalescing app-owned for v1 (§3.12), 24-char
+  timestamp viewer constraint (§3.2).
+
+**Review-pass findings (muse-log-helper, all folded):** Finding 1 — eager `ThreadKind` capture (§3.1).
+Finding 2 — single `String.logfmt` metadata renderer over `[String: Any?]`, `LogRecord` carries the
+rendered fragment, no divergent flatten (§3.1b). Nit A — sugar uses the same renderer/`[String: Any?]`
+(§3.9). Nit B — OSLog `os.Logger` cached per CATEGORY (§3.6). Nit C — `.dateStamped` has no internal
+timer; cheap check on every `receive()` + app-poked `rollIfDateChanged()` (§3.4).
+
+**Adam's decisions (folded):** (1) **Scope = Path A** — Muse migrates its call sites over time;
+LogDriver/SwiftToolbox go native swift-log LATER, separately; **no package-migration tasks here**.
+(2) **No `ClosureHandlerBridge` type** — apps route existing closures by calling the public
+`custom(level:…)` from inside their own closure (§3.10); the one required affordance is a
+dynamic-level entry (§3.9).
 
 **Remaining muse-ios invariants to honor (not questions — design constraints):** 240 build-time
 categories (app-owned enum), the logfmt context contract with self-rendering typed values
@@ -534,19 +623,20 @@ categories (app-owned enum), the logfmt context contract with self-rendering typ
 ## 8. Phasing
 1. ✅ Finalize boundary with log-helper (Q1–Q5) — done.
 2. ✅ Interview muse-ios (muse-log-helper), fold requirements (Q-A–Q-E + findings) — done.
-3. **Build:** Package.swift → LogCategory/LogRecord/Formatter → LogDestination/registry →
-   File/Memory/Console destinations → handler → closure bridge → bootstrap/LoggingHandle → sugar.
+3. **Build:** Package.swift → LogCategory/LogRecord(+ThreadKind)/Formatter → LogDestination/registry →
+   File/Memory/Console destinations → handler → bootstrap/LoggingHandle → sugar (incl. `custom(level:)`).
+   (No closure-bridge type — §3.10 is a doc note.)
 4. **Test:** suite per §6 with injected temp dir.
 5. **Review cycle** (log-helper: generic A–F + Swift-6; muse-log-helper: muse-ios reality), then
    offer as the muse-ios SwiftyBeaver replacement.
 
-**Muse cutover sequencing (muse-log-helper's recommendation — Adam's scope call, pending):**
-- Land FellerBuncher in Muse via the **closure bridge first, with ZERO behavior change** to
-  LogDriver/SwiftToolbox. The Muse cutover is already big on its own (SwiftyBeaver→FellerBuncher under
-  Muse's facade, re-implement MemoryDestination on our protocol, port the snapshot runtime toggle +
-  daily dated rotation, wire SentryDestination, preserve the 24-char wire format). Prove the log files
-  + support bundles + in-app viewer + Sentry are byte-for-byte as expected.
+**Muse cutover sequencing (DECIDED — Adam, Path A):**
+- Land FellerBuncher in Muse with **ZERO behavior change** to LogDriver/SwiftToolbox (their existing
+  closures call FellerBuncher's `custom(level:…)` directly — no package change). The Muse cutover is
+  already big on its own (SwiftyBeaver→FellerBuncher under Muse's facade, re-implement MemoryDestination
+  on our protocol, port the snapshot runtime toggle + daily dated rotation, wire SentryDestination,
+  preserve the 24-char wire format). Prove the log files + support bundles + in-app viewer + Sentry are
+  byte-for-byte as expected.
 - **THEN**, as a separate follow-up, migrate LogDriver/SwiftToolbox to native swift-log — observable
   change is only "same records arrive via a different producer." "Slow is smooth, smooth is fast."
-- Architecture is identical either way; the scope decision only moves the two package-migration tasks
-  between this effort and a follow-up. (Build the registry/co-equal-producers shape unconditionally.)
+- **No package-migration tasks in THIS effort.** Architecture is identical either way.
