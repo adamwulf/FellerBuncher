@@ -45,7 +45,8 @@ and handed over the decisions below. They are accepted as the foundation.
 | Rotation size / retention values | ✅ defaults | ✅ override |
 | Per-destination min level / category filter | ✅ defaults | ✅ override |
 | Which logger labels + metadata to attach | — | ✅ |
-| Log export / share flow | TBD (see Q5) | TBD |
+| Log zip (plumbing) | ⏸ optional, deferred (Q5) | — |
+| Log share/save **presentation** (UIKit) | — | ✅ always app |
 
 ---
 
@@ -103,9 +104,17 @@ Pure function `LogRecord -> String` (one line, newline-terminated). Responsibili
 - Append the message + metadata by handing **one dict** to `String.logfmt` (`["msg": …, …meta]`).
 - Sanitize: strip `\r`/`\n` and other control chars from the message and every metadata value
   before formatting, so one record is always exactly one line (gotcha D).
-- `level=` tokens: stable strings for all 7 swift-log levels. **PENDING Q3** (match log-helper's
-  exact strings for grep-compatibility; decide whether to collapse e.g. `notice→info`).
-- `ts=` format. **PENDING Q4** (leaning ISO8601 with fractional seconds + `Z`).
+- `level=` tokens: emit `level.rawValue` directly — all 7 distinct, **no collapsing**
+  (`trace debug info notice warning error critical`). `grep 'level=error'` just works.
+  Collapsing `notice→info` would throw away a level a consumer deliberately chose. (Q3)
+- `ts=` format: **ISO8601 with fractional seconds, UTC, `Z`-suffixed** →
+  `ts=2026-06-27T12:34:56.789Z`. Sortable (lexical == chronological) + human-readable. (Q4)
+  - Use a single `static let ISO8601DateFormatter` configured **once** in its initializer
+    (`[.withInternetDateTime, .withFractionalSeconds]`, `timeZone = UTC`) and **never
+    mutated**. `string(from:)` is then safe to call concurrently from many logging threads
+    (true since iOS 13 / macOS 10.15). Pin UTC explicitly so logs from different zones sort
+    and correlate. Making it a `var` or reconfiguring per-call reintroduces the classic
+    NSDateFormatter data race.
 
 ### 3.3 `LogDestination` (protocol)
 ```
@@ -124,26 +133,61 @@ Class, private serial `DispatchQueue`, `@unchecked Sendable`. Writes logfmt line
 - **Rotation** when the active file exceeds the size cap: rename `app.log → app-1.log`
   (shift existing rotated files up). **Truncate-in-place fallback** if the rename fails, so the
   size bound always holds and we don't trip rotation on every subsequent write (gotcha F).
+  Rotation is checked **before** each write, so the active file can overshoot the cap by at
+  most one record — bounded overshoot is intentional (avoids re-`stat` after every write).
 - **Pruning**: enforce max rotated-file count and/or max age, **never deleting the active
   file** (APFS keeps an unlinked-but-open file alive only for its holder → silent writes into
-  an unreachable inode → data loss). Skip `activeURL` in the prune sweep (gotcha E).
-- Defaults (size MB / max files / max age days): **PENDING Q1** (match log-helper unless reason not to).
-- Keeps a running byte count to avoid `stat`-ing on every write.
+  an unreachable inode → data loss). Skip `activeURL` in the prune sweep (gotcha E). Pruning
+  is per-directory (cleans the *other* process's stale `.log` files harmlessly too).
+- **Defaults (Q1, adopted from log-helper):**
+  - `maxFileBytes = 10 MB` per active file
+  - `rotatedFilesToKeep = 5` (`app-1.log` … `app-5.log`; oldest dropped) → worst case ≈ 60 MB/process
+  - `maxFileAge = 7 days` (prune anything older)
+  - `pruneInterval = 1 hour` — **the non-obvious one**: re-check prune at most hourly so a
+    chatty process doesn't `stat` the whole directory on every log line. Do not skip it.
+  - Start these as **private constants**, not bootstrap params. Promote to defaulted params
+    only when a consumer actually needs to differ. (muse-ios may need this — revisit after interview.)
 
 ### 3.5 `MemoryDestination` (for muse-ios in-memory target)
 Fixed-capacity ring buffer of recent `LogRecord`s behind a small lock/queue. Exposes a
 snapshot accessor for an in-app log viewer / export. Capacity configurable. **Details PENDING
 muse-ios interview** (size, whether it stores records or formatted lines, thread-safety needs).
 
-### 3.6 `ConsoleDestination`
-Dev-time visibility. **PENDING Q2**: plain `stderr`/`print` vs. mirroring to `os.Logger`/OSLog
-so it appears in Xcode + Console.app with proper levels. Current lean: offer **OSLog mirroring**
-as the default console for Apple platforms, with a stderr option for non-Apple/CLI.
+### 3.6 `ConsoleDestination` (Q2 — decided)
+Dev-time visibility. Expose a **`ConsoleMode` enum: `.osLog` (default) / `.stderr` / `.none`**.
+- `.osLog` (default on Apple platforms): write a small `OSLogDestination` that maps `label →
+  subsystem/category` and emits the **same formatted logfmt line** at the mapped os level. This
+  is a genuinely better default than stderr when consumers live in Xcode/Console.app — proper
+  level coloring, subsystem/category filtering, shows in the unified log.
+  - **Gotcha:** `os_log` redacts interpolated values as `<private>` by default. Emit the line
+    with `privacy: .public` (`%{public}s`) — safe because we control + already sanitize the
+    formatting, so nothing sensitive is added by making it public.
+- `.stderr`: swift-log's `StreamLogHandler.standardError` equivalent, for server-side / CLI /
+  non-Apple consumers.
+- `.none`: file (and/or memory) only.
+
+**Three distinct roles (log-helper's mental model, worth preserving):**
+1. **File** = the durable logfmt record.
+2. **Console (stderr or OSLog)** = dev-time echo.
+3. **A dedicated OSLog breadcrumb channel** for the *writer's own* degradation events
+   ("write failed", "rotation move failed") — these must survive even when the file path
+   itself is broken, so they go to OSLog regardless of `ConsoleMode`. This is separate from
+   the `.osLog` console mode and always on.
 
 ### 3.7 `FellerBuncherLogHandler` (swift-log `LogHandler`)
-Holds the destination set + the per-logger `logLevel`/`metadata` swift-log requires. On
-`log(...)`: build a `LogRecord` once, fan out to each destination that passes its filter. The
-handler itself is cheap; destinations own their own threading.
+Holds the destination set + the per-logger `logLevel`/`metadata` swift-log requires. On a log
+call: build a `LogRecord` once, fan out to each destination that passes its filter. The handler
+itself is cheap; destinations own their own threading.
+- **Implement `log(event:)`** (swift-log 1.14+) rather than the deprecated long-form
+  `log(level:message:metadata:source:file:function:line:)`. `log(event:)` is the supported path
+  AND carries the event's optional `error`, which we fold into the metadata bag as `error=…`
+  (its `localizedDescription` routinely contains newlines → sanitized per gotcha D). **Check the
+  swift-log version paired with our Logfmt:** if it predates 1.14, implement the long-form
+  signature and we forgo the free `error`.
+- **Keep `format(...)` a STATIC pure function** (`timestamp/level/label/message/metadata →
+  String`, no I/O, no writer). Then every formatting test exercises it directly with no temp
+  files (embedded-newline-stays-one-line, quote/space-escaping, nested-dict dot-flatten,
+  msg-not-first-when-a-key-sorts-before-it). Only the writer tests need an injected temp dir.
 
 ### 3.8 `FellerBuncher.bootstrap(...)` (entry point)
 ```
@@ -151,14 +195,14 @@ FellerBuncher.bootstrap(
     processName: String,
     logDir: URL,
     // all below default:
-    fileRotationBytes: Int = …,        // PENDING Q1
-    maxRotatedFiles: Int = …,          // PENDING Q1
-    maxLogAgeDays: Int = …,            // PENDING Q1
-    console: ConsoleMode = …,          // PENDING Q2
+    console: ConsoleMode = .osLog,     // .osLog / .stderr / .none (Q2)
     inMemory: Bool = false,            // muse-ios opt-in
     minimumLevel: Logger.Level = .info
 )
 ```
+Rotation/prune values (10 MB / keep 5 / 7 days / hourly prune) start as **private constants**
+in `FileDestination`, not bootstrap params (Q1). Promote to defaulted params only when a
+consumer needs to differ.
 - Builds the destinations, installs the handler via `LoggingSystem.bootstrap`.
 - **Idempotency**: an `NSLock`-guarded `Bool` wraps the `LoggingSystem.bootstrap` call so
   repeat calls (app + extension calling per-request) are safe no-ops, never a trap (gotcha A).
@@ -191,6 +235,23 @@ log.debug(…) / log.warning(…) / log.error(…)
 - **Thread-safety via queue confinement**, `@unchecked Sendable` only where state is provably
   queue-confined.
 
+### 4.1 Concurrency contract (Adam's requirement)
+- **The public interface needs NO async/await.** This falls out naturally: swift-log's `Logger`
+  API is synchronous and fire-and-forget, `bootstrap(...)` is synchronous, and the convenience
+  sugar is synchronous. A pre-concurrency / non-async call site can use the entire logging path
+  without ever entering an `async` context. This is the default and the goal.
+- **Where an API genuinely must do async work** (the only realistic candidates: the deferred
+  log **export/zip**, and **`flush()`/drain** for graceful shutdown or tests), provide **THREE**
+  shapes of the same operation so no caller is forced into `async`:
+  1. **Synchronous** where it can block safely (e.g. `flush()` via `queue.sync {}` — test/shutdown only).
+  2. **Callback / completion-handler** variant — `func export(..., completion: @escaping @Sendable (Result<URL, Error>) -> Void)` — for pre-concurrency callers and Objective-C-ish call sites.
+  3. **async/await** variant — `func export(...) async throws -> URL` — typically a thin
+     `withCheckedThrowingContinuation` wrapper over the callback form, so the two never diverge.
+- **Implementation rule:** write the callback form as the source of truth; derive the `async`
+  form from it via a continuation. One code path, two surfaces — they can't drift.
+- The internal `DispatchQueue`-confined writer stays as-is (no actors — gotcha N3); the
+  async surface is only a wrapper at the public boundary, never in the hot logging path.
+
 ---
 
 ## 5. Package layout (target)
@@ -206,6 +267,7 @@ Sources/FellerBuncher/
   ConsoleDestination.swift          # OSLog / stderr
   FellerBuncherLogHandler.swift     # swift-log LogHandler fan-out
   Logger+Convenience.swift          # ergonomic sugar
+  # LogExporter.swift               # DEFERRED (Q5): Foundation-only zip plumbing, no UIKit
 Tests/FellerBuncherTests/           # inject temp dir
 plans/PLAN.md                       # this file
 ```
@@ -225,14 +287,19 @@ plans/PLAN.md                       # this file
 
 ---
 
-## 7. Open questions (blocking the marked components)
+## 7. Open questions
 
-**To log-helper (asked, awaiting answers):**
-- **Q1** Default rotation size (MB), max rotated files, max age (days). → blocks §3.4, §3.8.
-- **Q2** Console echo: stderr/print vs OSLog mirroring (or both). → blocks §3.6, §3.8.
-- **Q3** `level=` token strings for all 7 swift-log levels; any collapsing. → blocks §3.2.
-- **Q4** `ts=` format (ISO8601 w/ fractional + Z?). → blocks §3.2.
-- **Q5** Is the log exporter (zip/share) part of the **package** or the **app**? → blocks layout.
+**To log-helper — ALL RESOLVED (answers folded into the sections above):**
+- ✅ **Q1** Defaults: 10 MB / keep 5 / 7 days / hourly prune guard; start as constants. → §3.4, §3.8.
+- ✅ **Q2** Console: `ConsoleMode` enum `.osLog` (default) / `.stderr` / `.none`; OSLog needs
+  `privacy: .public`; plus an always-on OSLog breadcrumb channel for writer degradation. → §3.6, §3.8.
+- ✅ **Q3** `level=level.rawValue`, all 7 distinct, no collapsing. → §3.2.
+- ✅ **Q4** ISO8601 + fractional seconds + UTC `Z`; frozen `static let` formatter. → §3.2.
+- ✅ **Q5** Zip = optional package plumbing (deferred); share/save presentation = always the app.
+  If built: zip via `NSFileCoordinator(.forUploading)` and **copy the zip INSIDE the coordinator
+  accessor block** — Apple unlinks the temp file the instant the block returns, so copying after
+  `coordinate()` returns hands back a dead URL. Test that the returned URL is readable AFTER the
+  block. Deferred for now — least reusable piece. → see §5 (commented out).
 
 **To muse-ios (interview pending Adam's intro):** what's unique/important in their
 SwiftyBeaver setup — in-memory target shape, filtering logs to different destinations,
