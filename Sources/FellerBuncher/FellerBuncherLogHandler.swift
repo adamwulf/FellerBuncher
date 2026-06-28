@@ -1,6 +1,11 @@
 import Foundation
 import Logging
 
+enum FellerBuncherBridge {
+    static let categoryKey = "__fellerbuncher_category"
+    static let metadataFragmentKey = "__fellerbuncher_metadata"
+}
+
 public struct FellerBuncherLogHandler: LogHandler {
     public var metadataProvider: Logger.MetadataProvider?
     public var metadata: Logger.Metadata
@@ -37,16 +42,29 @@ public struct FellerBuncherLogHandler: LogHandler {
         if let eventMetadata = event.metadata {
             combinedMetadata.merge(eventMetadata) { _, eventValue in eventValue }
         }
+        let category = combinedMetadata
+            .removeValue(forKey: FellerBuncherBridge.categoryKey)
+            .flatMap(Self.stringValue)
+            .map { LogCategory(rawValue: $0) } ?? .default
+        let bridgedFragment = combinedMetadata
+            .removeValue(forKey: FellerBuncherBridge.metadataFragmentKey)
+            .flatMap(Self.stringValue) ?? ""
         var renderedMetadata = combinedMetadata.mapValues(Self.metadataValue)
         if let error = event.error {
             renderedMetadata["error"] = (error as NSError).localizedDescription
         }
+        let nativeFragment = LogRecord.renderMetadata(renderedMetadata)
+        let metadataFragment = [nativeFragment, bridgedFragment]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let message = event.message.description
 
         let record = LogRecord(
             level: event.level,
             label: label,
-            message: event.message.description,
-            metadata: renderedMetadata,
+            category: category,
+            message: message.isEmpty ? nil : message,
+            metadataFragment: metadataFragment,
             file: event.file,
             function: event.function,
             line: event.line
@@ -74,6 +92,17 @@ public struct FellerBuncherLogHandler: LogHandler {
             value.mapValues(metadataValue)
         case .array(let value):
             value.map(metadataValue)
+        }
+    }
+
+    private static func stringValue(_ value: Logger.Metadata.Value) -> String? {
+        switch value {
+        case .string(let value):
+            value
+        case .stringConvertible(let value):
+            value.description
+        case .dictionary, .array:
+            nil
         }
     }
 }

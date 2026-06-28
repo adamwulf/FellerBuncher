@@ -35,6 +35,30 @@ public struct LogRecord: Sendable {
         function: String = #function,
         line: UInt = #line
     ) {
+        self.init(
+            timestamp: timestamp,
+            level: level,
+            label: label,
+            category: category,
+            message: message,
+            metadataFragment: Self.renderMetadata(metadata),
+            file: file,
+            function: function,
+            line: line
+        )
+    }
+
+    init(
+        timestamp: Date = Date(),
+        level: Logger.Level,
+        label: String,
+        category: LogCategory = .default,
+        message: String? = nil,
+        metadataFragment: String,
+        file: String,
+        function: String,
+        line: UInt
+    ) {
         self.timestamp = timestamp
         self.level = level
         self.label = Self.sanitize(label)
@@ -44,7 +68,11 @@ public struct LogRecord: Sendable {
         self.function = Self.sanitize(function)
         self.line = line
         self.thread = Thread.isMainThread ? .main : .bg
-        self.metadataFragment = String.logfmt(Self.sanitizedMetadata(metadata))
+        self.metadataFragment = metadataFragment
+    }
+
+    static func renderMetadata(_ metadata: [String: Any?]) -> String {
+        String.logfmt(Self.sanitizedMetadata(metadata))
     }
 
     private static func sanitizedMetadata(_ metadata: [String: Any?]) -> [String: Any] {

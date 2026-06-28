@@ -198,17 +198,19 @@ extension Logger {
 `debug` / `warning` / `error` mirror `info`. Call sites:
 ```swift
 log.info("wrote", metadata: ["bytes": n])      // msg + metadata, default category
-log.info(.mcp, "started", metadata: ["port": p]) // category + msg + metadata
-log.info(.mcp, "started")                        // category + msg
-log.info(.mcp, metadata: ["foo": "bar"])         // category + metadata, NO msg  (Muse style)
-log.custom(level: lvl, .mcp, "msg", metadata: ["k": v])  // dynamic level
+log.info(AppCategory.mcp, "started", metadata: ["port": p]) // category + msg + metadata
+log.info(AppCategory.mcp, "started")                        // category + msg
+log.info(AppCategory.mcp, metadata: ["foo": "bar"])         // category + metadata, NO msg
+log.custom(level: lvl, AppCategory.mcp, "msg", metadata: ["k": v]) // dynamic level
 ```
 - **`metadata:` is LABELED** (matches MuseLog's labeled `context:`). MuseLog names its first arg
   `message:` though its TYPE is the category enum — **do NOT inherit that name**; here the category arg
   is positional and the dict is `metadata:`. (A `MuseLog` shim keeping `context:` forwards trivially.)
 - Overloads resolve unambiguously: first arg is `Logger.Message` (string literal) or
-  `some LogCategoryConvertible` (leading-dot enum); after a category, the next positional is a
-  `Logger.Message` or absent.
+  `some LogCategoryConvertible`; after a category, the next positional is a `Logger.Message` or
+  absent. Swift cannot infer an arbitrary application enum from bare `.mcp` in a generic parameter,
+  so call sites qualify it as `AppCategory.mcp`. App codegen may emit constrained static forwarders
+  if bare-member syntax is required.
 - `message` is `@autoclosure` (not built when the gate drops the call); `Logger.Message?` on the
   category overloads so it can be omitted.
 - All overloads render `[String: Any?]` through the **same `String.logfmt` renderer**, eagerly on the
@@ -229,9 +231,9 @@ dynamic-level entry is the only affordance this needs.
 - **Tests:** a message emits `msg="…"`, none emits **no `msg=`** (never `msg=""`); category-only renders
   the category as the leading body token; the dict is never the body; the four overload shapes resolve
   unambiguously; sugar and the closure path produce identical bytes; `custom(level:)` routes a dynamic
-  level; an app `enum Cat: String` conformed to `LogCategoryConvertible` works in `log.info(.mcp, …)`
-  with no per-call `.init(rawValue:)`; `@autoclosure` message NOT evaluated when the gate drops the call;
-  `file/function/line` forwarded.
+  level; an app `enum Cat: String` conformed to `LogCategoryConvertible` works in
+  `log.info(Cat.mcp, …)` with no per-call `.init(rawValue:)`; `@autoclosure` message NOT evaluated
+  when the gate drops the call; `file/function/line` forwarded.
 
 ### Phase 4 — Multi-destination
 **Goal:** fan one record out to many destinations with per-destination filtering, safe runtime
