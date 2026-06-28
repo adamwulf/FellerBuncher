@@ -287,7 +287,12 @@ protocol LogDestination: AnyObject, Sendable {
   runs. If `removeDestination` closed the FileHandle synchronously off-queue, a late `receive()` would
   enqueue a write onto a queue whose handle is closing → crash / lost write. So `tearDown` does
   `queue.async { drain; close }`; a late `receive()` is then ordered either **before** the close (it
-  writes — fine) or **after** (queue sees `handle == nil`, no-ops via the existing degraded-write path).
+  writes — fine) or **after** (queue sees the terminal flag, no-ops).
+  - **R2 reopen-after-teardown trap (log-helper):** the degraded-write path is `handle == nil →
+    openHandleIfNeeded()`, so a late `receive()` running AFTER close would otherwise **resurrect the
+    file we just tore down.** Fix: `tearDown` sets a **terminal `closed` flag** (queue-confined,
+    checked in `performWrite` BEFORE `openHandleIfNeeded`); post-close writes no-op instead of
+    reopening. This is the one place R2 can leak a reopened file — must be in the code.
 - Each destination is a **class** (so Muse can conform its own `MemoryDestination` with a custom
   `receive`/send, replacing their SwiftyBeaver `BaseDestination` subclass) and holds its own
   `LogfmtFormatter` config.
@@ -597,6 +602,12 @@ is behind where ours should be). The two friction points and their fixes (from l
   lock (`os_unfair_lock`/`NSLock`), read+swapped whole (§3.3). So a destination has TWO
   synchronization domains — the serial queue (handle/writes) and the filter lock (config) — both
   documented, neither relying on the other. ThreadSanitizer must be clean on a level-flip-during-burst.
+  - **Whole-value swap, not three separately-locked fields (log-helper):** the bug being prevented is
+    `level` and `categories` tearing **relative to each other**, so they must move as one `FilterConfig`
+    value under one lock — never three independently-synchronized fields.
+  - **Lock-ordering rule (deadlock prevention):** the two domains must **never nest** — do NOT take the
+    filter lock while on the serial queue, nor `queue.sync` while holding the filter lock. Read a
+    `filterConfig()` snapshot first, then act; the queue work uses the snapshot, not the live lock.
 
 ---
 
@@ -626,6 +637,22 @@ plans/PLAN.md                       # this file
 ---
 
 ## 6. Test plan (inject a temp dir — never touch real containers)
+
+**Run the suite under ThreadSanitizer (log-helper — the ONLY thing that catches R1/R2).** Critical
+methodology note: `-strict-concurrency=complete` AND a normal `swift test` can **both pass while the
+code is still racy** — complete checking proves the TYPES are `Sendable`, NOT that an `@unchecked`
+assertion is actually true. Only a runtime race detector catches a torn read (R1) or use-after-close
+(R2). So: `swift test --sanitize=thread`, and run the *whole* functional suite under TSan too (the
+eager-thread-capture path and the memory ring buffer's lock are cheap places an accidental off-lock
+read hides). The two race tests below are MEANINGLESS without TSan on — a plain functional test will
+not catch them:
+- **R1 race test:** one thread tight-loops `setGlobalLevel(.debug)↔(.info)` while N threads fan out
+  records through a destination whose `shouldLog` reads `filterConfig()`. Without the whole-value lock,
+  TSan flags the torn read; with it, clean.
+- **R2 race test:** tight-loop `addDestination`/`removeDestination` on a `FileDestination` while a
+  burst of writes fans out. Assert (a) no crash, (b) no write lands after close / **no reopen after
+  teardown** (the terminal `closed`-flag check), (c) nothing lost from destinations that stayed registered.
+
 - logfmt formatting: stable leading-field order; correct escaping/quoting via String.logfmt.
 - **Timestamp wire-format lock (regression guard, R5 — MULTIPLE fractional values, not one):** assert
   `Date.ISO8601FormatStyle` output is **byte-identical** to `ISO8601DateFormatter` with
