@@ -167,49 +167,60 @@ everything else formats through.
 ### Phase 3 — Ergonomic helpers
 **Goal:** the convenient call sites. Completes the original five concerns.
 
-**`message` is always a distinct argument — it is NOT folded into the metadata dict.** This is the
-key contract decision. The message maps to logfmt's distinguished `msg=` field (every line is
-`ts=… level=… msg="…" key=val …`), it mirrors swift-log's own `info(_ message:, metadata:)` shape, and
-it matches the real consumers' facades. Folding it in (e.g. `info(.mcp, ["state": "started"])`) would
-produce a line with **no `msg=` field**, breaking `grep msg=`, log viewers, and the wire-format
-convention. So the dict is **always pure metadata**; the human-readable text is its own arg.
+**`message` and `category` are BOTH optional; the metadata dict is always pure metadata.** When a
+message IS given it stays a distinct arg (never folded into the dict) so it renders as logfmt's
+distinguished `msg=` field; when it's absent the line simply has no `msg=`. This supports both styles:
+- swift-log's message-first style: `log.info("wrote", ["bytes": n])` → `… msg="wrote" bytes=42`
+- Muse's category+context style: `log.info(.mcp, ["foo": "bar"])` → `… category=mcp foo=bar`
+  (Muse's `MuseLog` has NO message arg — it's category + context dict, rendering `mcp foo=bar mum=ble`.
+  So we do NOT *require* a message; we make it optional.)
 
-The category is an **optional first argument** (defaulted), so the two "sugars" are really one family
-of overloads — category is just present or absent:
+The earlier "message is always distinct" was overstated — Muse proves the no-message form is real. The
+rule is narrower: **the dict is never the message; if you want human text it's a separate arg that
+becomes `msg=`.** Folding text into the dict (`["state": "started"]`) is a metadata key, not a message,
+and produces no `msg=` — fine if intended, but it's then metadata, not the message.
+
+Both `message` and `category` optional means an overload family of {category?} × {message?} ×
+{metadata?}. They're unambiguous because the first arg is either `Logger.Message` (string literal) or
+`some LogCategoryConvertible` (leading-dot enum), and the post-category arg is either a `Logger.Message`
+or a `[String: Any?]`:
 
 ```swift
 extension Logger {
-    // message + optional metadata (category omitted → default category)
+    // message [+ metadata]  — category omitted → default category
     func info(_ message: @autoclosure () -> Logger.Message,
               _ metadata: [String: Any?] = [:],
               file: String = #fileID, function: String = #function, line: UInt = #line)
 
-    // category + message + optional metadata
+    // category [+ message] [+ metadata]  — message omitted → no msg= field (Muse's style)
     func info(_ category: some LogCategoryConvertible,
-              _ message: @autoclosure () -> Logger.Message,
+              _ message: @autoclosure () -> Logger.Message? = nil,
               _ metadata: [String: Any?] = [:],
               file: String = #fileID, function: String = #function, line: UInt = #line)
 
-    // dynamic level (the closure-path entry) — same two shapes with `level:` up front
+    // dynamic level (the closure-path entry) — same shapes with `level:` up front
     func custom(level: Logger.Level,
                 _ category: some LogCategoryConvertible,
-                _ message: @autoclosure () -> Logger.Message,
+                _ message: @autoclosure () -> Logger.Message? = nil,
                 _ metadata: [String: Any?] = [:],
                 file: String = #fileID, function: String = #function, line: UInt = #line)
 }
 ```
 `debug` / `warning` / `error` mirror `info` exactly. Call sites read:
 ```swift
-log.info("wrote", ["bytes": n, "path": url])          // no category → default
-log.info(.mcp, "started", ["port": p])                // category + msg + metadata
-log.info(.mcp, "started")                             // category + msg, metadata defaulted
-log.custom(level: lvl, .mcp, "msg", ["k": v])         // dynamic level (closure path)
+log.info("wrote", ["bytes": n, "path": url])   // msg + metadata, default category
+log.info(.mcp, "started", ["port": p])         // category + msg + metadata
+log.info(.mcp, "started")                       // category + msg, no metadata
+log.info(.mcp, ["foo": "bar", "mum": "ble"])    // category + metadata, NO msg  (Muse's style)
+log.custom(level: lvl, .mcp, "msg", ["k": v])   // dynamic level (closure path)
 ```
-- **Why `(.mcp, "started", ["port": p])` and not `(.mcp, ["state": "started", "port": p])`:** the
-  message stays distinct (see above) so the line gets a real `msg="started"` and `port=…` is metadata.
-- `message` is `@autoclosure` (matches swift-log) so it isn't built when the level gate drops the call.
+- `message` is `@autoclosure` (matches swift-log) so it isn't built when the level gate drops the call;
+  it's `Logger.Message?` on the category overloads so it can be omitted.
 - `metadata` defaults to `[:]` and is the trailing unlabeled arg — the ergonomic win over swift-log's
-  `metadata:` + `.stringConvertible` boilerplate.
+  `metadata:` + `.stringConvertible` boilerplate. The dict is **always pure metadata**.
+- The formatter **omits the `msg=` field entirely when there is no message** (never emits `msg=""`),
+  and renders the category per its field config — Muse's shape is category as a leading bare token
+  (`mcp foo=bar`), the default elsewhere is `category=mcp`. (See `LogfmtFormatter`, Phase 1.)
 - All overloads render the `[String: Any?]` bag through the **same `String.logfmt` renderer** as the
   closure path (one renderer → sugar and bridge can't drift), eagerly on the calling thread.
 - Additive on the real `Logger` — not a replacement type.
@@ -218,12 +229,17 @@ log.custom(level: lvl, .mcp, "msg", ["k": v])         // dynamic level (closure 
 `log.custom(level:_:_:_:)` directly, mapping its runtime `level` and handing `context` as the metadata
 bag. The dynamic-level entry is the only affordance this requires.
 
-- **Tests:** every overload emits a distinct `msg=` field (message never collapses into metadata);
-  category-omitted vs category-present both work; sugar and the closure path produce identical bytes
-  for the same bag; `custom(level:)` routes a dynamic level correctly; an app `enum Cat: String`
-  conformed to `LogCategoryConvertible` works in `log.info(.mcp, …)` with no per-call
-  `.init(rawValue:)`; `@autoclosure` message is NOT evaluated when the level gate drops the call;
-  `file/function/line` forwarded.
+- **Tests:** a call WITH a message emits `msg="…"`; a call WITHOUT one emits **no `msg=`** (never
+  `msg=""`); the dict is never treated as the message; all four overload shapes resolve unambiguously
+  (msg-only / category+msg / category+metadata / category+msg+metadata); sugar and the closure path
+  produce identical bytes for the same bag; `custom(level:)` routes a dynamic level correctly; an app
+  `enum Cat: String` conformed to `LogCategoryConvertible` works in `log.info(.mcp, …)` with no
+  per-call `.init(rawValue:)`; `@autoclosure` message is NOT evaluated when the level gate drops the
+  call; `file/function/line` forwarded.
+
+> **PENDING muse-log-helper confirmation:** the exact `MuseLog` API shape (message vs category vs the
+> codegen'd enum) — see the question out to them. Adjust these signatures if MuseLog differs from the
+> assumed category+context form.
 
 ### Phase 4 — Multi-destination
 **Goal:** fan one record out to many destinations with per-destination filtering, safe runtime
