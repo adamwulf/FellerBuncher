@@ -9,10 +9,33 @@ enum FellerBuncherBridge {
 public struct FellerBuncherLogHandler: LogHandler {
     public var metadataProvider: Logger.MetadataProvider?
     public var metadata: Logger.Metadata
-    public var logLevel: Logger.Level
+    public var logLevel: Logger.Level {
+        get {
+            registry.hasForceIncludedCategories()
+                ? .trace
+                : configuredLogLevel
+        }
+        set {
+            configuredLogLevel = newValue
+        }
+    }
 
     public let label: String
-    private let destinations: [any LogDestination]
+    private let registry: DestinationRegistry
+    private var configuredLogLevel: Logger.Level
+
+    public init(
+        label: String,
+        registry: DestinationRegistry,
+        minimumLevel: Logger.Level = .info,
+        metadataProvider: Logger.MetadataProvider? = nil
+    ) {
+        self.label = label
+        self.registry = registry
+        self.configuredLogLevel = minimumLevel
+        self.metadata = [:]
+        self.metadataProvider = metadataProvider
+    }
 
     public init(
         label: String,
@@ -20,11 +43,12 @@ public struct FellerBuncherLogHandler: LogHandler {
         minimumLevel: Logger.Level = .info,
         metadataProvider: Logger.MetadataProvider? = nil
     ) {
-        self.label = label
-        self.destinations = destinations
-        self.logLevel = minimumLevel
-        self.metadata = [:]
-        self.metadataProvider = metadataProvider
+        self.init(
+            label: label,
+            registry: DestinationRegistry(destinations: destinations),
+            minimumLevel: minimumLevel,
+            metadataProvider: metadataProvider
+        )
     }
 
     public subscript(metadataKey key: String) -> Logger.Metadata.Value? {
@@ -33,7 +57,14 @@ public struct FellerBuncherLogHandler: LogHandler {
     }
 
     public func log(event: LogEvent) {
-        guard event.level >= logLevel else {
+        let bridgedCategory: LogCategory = (
+            event.metadata?[FellerBuncherBridge.categoryKey]
+        )
+            .flatMap(Self.stringValue)
+            .map { LogCategory(rawValue: $0) } ?? LogCategory.default
+        guard event.level >= configuredLogLevel
+            || registry.forceIncludes(bridgedCategory)
+        else {
             return
         }
 
@@ -70,9 +101,7 @@ public struct FellerBuncherLogHandler: LogHandler {
             line: event.line
         )
 
-        for destination in destinations where destination.shouldLog(record) {
-            destination.receive(record)
-        }
+        registry.fanOut(record)
     }
 
     public static func format(

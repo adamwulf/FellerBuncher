@@ -3,14 +3,21 @@ import Logging
 
 public final class LoggingHandle: Sendable {
     public let fileDestination: FileDestination
-    public let destinations: [any LogDestination]
+    public let memoryDestination: MemoryDestination?
+    public let registry: DestinationRegistry
 
     init(
         fileDestination: FileDestination,
-        destinations: [any LogDestination]
+        memoryDestination: MemoryDestination?,
+        registry: DestinationRegistry
     ) {
         self.fileDestination = fileDestination
-        self.destinations = destinations
+        self.memoryDestination = memoryDestination
+        self.registry = registry
+    }
+
+    public var destinations: [any LogDestination] {
+        registry.snapshot()
     }
 }
 
@@ -50,33 +57,40 @@ public func bootstrap(
         retention: retention,
         filterConfig: filterConfig
     )
+    let consoleDestination = console == .none
+        ? nil
+        : ConsoleDestination(
+            mode: console,
+            subsystem: Bundle.main.bundleIdentifier ?? processName,
+            formatter: formatter,
+            filterConfig: filterConfig
+        )
+    let memoryDestination = inMemory
+        ? MemoryDestination(filterConfig: filterConfig)
+        : nil
     let destinations: [any LogDestination]
-    if console != .none {
-        destinations = [
-            fileDestination,
-            ConsoleDestination(
-                mode: console,
-                subsystem: processName,
-                formatter: formatter,
-                filterConfig: filterConfig
-            ),
-        ]
-    } else {
+    switch (consoleDestination, memoryDestination) {
+    case let (.some(consoleDestination), .some(memoryDestination)):
+        destinations = [fileDestination, consoleDestination, memoryDestination]
+    case let (.some(consoleDestination), .none):
+        destinations = [fileDestination, consoleDestination]
+    case let (.none, .some(memoryDestination)):
+        destinations = [fileDestination, memoryDestination]
+    case (.none, .none):
         destinations = [fileDestination]
     }
-
-    // MemoryDestination arrives in Phase 4; retain the argument for source compatibility.
-    _ = inMemory
+    let registry = DestinationRegistry(destinations: destinations)
 
     let handle = LoggingHandle(
         fileDestination: fileDestination,
-        destinations: destinations
+        memoryDestination: memoryDestination,
+        registry: registry
     )
     LoggingSystem.bootstrap(
         { label, metadataProvider in
             FellerBuncherLogHandler(
                 label: label,
-                destinations: destinations,
+                registry: registry,
                 minimumLevel: minimumLevel,
                 metadataProvider: metadataProvider
             )

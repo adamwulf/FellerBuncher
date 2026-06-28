@@ -212,6 +212,7 @@ func bootstrapIsIdempotentAndFirstLogLands() throws {
         processName: "bootstrap-app",
         logDir: firstDirectory,
         console: .none,
+        inMemory: true,
         minimumLevel: .debug,
         rotationPolicy: .none
     )
@@ -237,6 +238,8 @@ func bootstrapIsIdempotentAndFirstLogLands() throws {
         encoding: .utf8
     )
     #expect(contents.contains("msg=first"))
+    let memory = try #require(first.memoryDestination)
+    #expect(memory.snapshot().map(\.message) == ["first"])
     #expect(
         !FileManager.default.fileExists(
             atPath: secondDirectory.appendingPathComponent("ignored-app.log").path
