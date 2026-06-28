@@ -10,6 +10,7 @@ public struct LogfmtFormatter: Sendable {
 
     public enum LevelStyle: Sendable, Hashable {
         case raw
+        case uppercase
         case paddedUppercase
     }
 
@@ -31,10 +32,11 @@ public struct LogfmtFormatter: Sendable {
 
     public static let defaultFields: [Field] = [
         .timestamp,
+        .thread,
         .level,
+        .source,
         .label,
         .category,
-        .thread,
         .message,
         .metadata,
     ]
@@ -45,8 +47,8 @@ public struct LogfmtFormatter: Sendable {
     public let fields: [Field]
 
     public init(
-        timestampStyle: TimestampStyle = .iso8601,
-        levelStyle: LevelStyle = .raw,
+        timestampStyle: TimestampStyle = .utcSpaceSeparated,
+        levelStyle: LevelStyle = .uppercase,
         categoryStyle: CategoryStyle = .field,
         fields: [Field] = LogfmtFormatter.defaultFields
     ) {
@@ -82,7 +84,7 @@ public struct LogfmtFormatter: Sendable {
                 switch config.levelStyle {
                 case .raw:
                     components.append("level=\(level)")
-                case .paddedUppercase:
+                case .uppercase, .paddedUppercase:
                     components.append(level)
                 }
             case .label:
@@ -99,9 +101,12 @@ public struct LogfmtFormatter: Sendable {
             case .thread:
                 components.append(record.thread == .main ? "[UI]" : "[BG]")
             case .source:
+                let type = URL(fileURLWithPath: record.file)
+                    .deletingPathExtension()
+                    .lastPathComponent
                 components.append(
                     String.logfmt(
-                        "\(record.file).\(record.function):\(record.line)"
+                        "\(type).\(record.function):\(record.line)"
                     )
                 )
             case .message:
@@ -132,13 +137,19 @@ public struct LogfmtFormatter: Sendable {
             includingFractionalSeconds: true,
             timeZone: .gmt
         )
-        return iso8601.format(roundedToMilliseconds)
+        let formatted = iso8601.format(roundedToMilliseconds)
+        if style == .utcSpaceSeparated {
+            return String(formatted.dropLast())
+        }
+        return formatted
     }
 
     private static func formatLevel(_ level: Logger.Level, style: LevelStyle) -> String {
         switch style {
         case .raw:
             level.rawValue
+        case .uppercase:
+            level.rawValue.uppercased()
         case .paddedUppercase:
             level.rawValue.uppercased().padding(
                 toLength: 8,

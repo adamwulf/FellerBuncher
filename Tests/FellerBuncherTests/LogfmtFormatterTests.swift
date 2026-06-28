@@ -16,7 +16,10 @@ func stableLeadingFieldOrder() {
         label: "network",
         category: "sync",
         message: "connected",
-        metadata: ["attempt": 2]
+        metadata: ["attempt": 2],
+        file: "Example/AppDelegate.swift",
+        function: "logDiskAndMemoryUsage()",
+        line: 188
     )
 
     let line = LogfmtFormatter().format(record)
@@ -24,7 +27,7 @@ func stableLeadingFieldOrder() {
 
     #expect(
         line
-            == "ts=2026-06-27T13:04:56.789Z level=warning label=network category=sync \(thread) msg=connected attempt=2"
+            == "2026-06-27 13:04:56.789 \(thread) WARNING AppDelegate.logDiskAndMemoryUsage():188 label=network category=sync msg=connected attempt=2"
     )
 }
 
@@ -117,10 +120,14 @@ func configsRenderSameRecordDifferently() {
         category: "database.connect",
         metadata: ["retry": true]
     )
-    let generic = LogfmtFormatter(fields: [.level, .category, .metadata])
+    let generic = LogfmtFormatter(
+        timestampStyle: .iso8601,
+        levelStyle: .raw,
+        fields: [.level, .category, .metadata]
+    )
     let muse = LogfmtFormatter(
         timestampStyle: .utcSpaceSeparated,
-        levelStyle: .paddedUppercase,
+        levelStyle: .uppercase,
         categoryStyle: .bareBodyToken,
         fields: [.timestamp, .thread, .level, .category, .metadata]
     )
@@ -129,12 +136,12 @@ func configsRenderSameRecordDifferently() {
     #expect(generic.format(record) == "level=error category=database.connect retry=true")
     #expect(
         muse.format(record)
-            == "2026-06-27 13:04:56.789Z \(thread) ERROR    database.connect retry=true"
+            == "2026-06-27 13:04:56.789 \(thread) ERROR database.connect retry=true"
     )
 }
 
 @Test
-func customTimestampIsExactly24Characters() {
+func customTimestampIsExactly23Characters() {
     let record = LogRecord(timestamp: fixedDate, level: .info, label: "test")
     let line = LogfmtFormatter(
         timestampStyle: .utcSpaceSeparated,
@@ -142,8 +149,8 @@ func customTimestampIsExactly24Characters() {
     ).format(record)
     let timestamp = line
 
-    #expect(timestamp == "2026-06-27 13:04:56.789Z")
-    #expect(timestamp.count == 24)
+    #expect(timestamp == "2026-06-27 13:04:56.789")
+    #expect(timestamp.count == 23)
 }
 
 @Test(
@@ -158,7 +165,10 @@ func customTimestampIsExactly24Characters() {
 func iso8601WireFormatMatchesLegacyFormatter(fraction: TimeInterval) {
     let date = Date(timeIntervalSince1970: 1_782_565_496 + fraction)
     let record = LogRecord(timestamp: date, level: .info, label: "test")
-    let line = LogfmtFormatter(fields: [.timestamp]).format(record)
+    let line = LogfmtFormatter(
+        timestampStyle: .iso8601,
+        fields: [.timestamp]
+    ).format(record)
     let actual = String(line.dropFirst("ts=".count))
     let legacy = ISO8601DateFormatter()
     legacy.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

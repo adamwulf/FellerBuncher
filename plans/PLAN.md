@@ -98,14 +98,15 @@ everything else formats through.
   (set membership), an optional wire field, and the OSLog `category:`.
 - **`LogfmtFormatter`** — a per-destination **config**, still a pure static `LogRecord -> String`
   function. Parameterized by:
-  - **Timestamp style** — default `.iso8601`; per-destination overridable (e.g. a 24-char
-    `yyyy-MM-dd HH:mm:ss.SSS` UTC).
-  - **Level style** — `.raw` (default, `level.rawValue`) | `.paddedUppercase`. All 7 levels stay
-    distinct, **no collapsing** (`grep level=error` must work).
+  - **Timestamp style** — default `.utcSpaceSeparated`
+    (`yyyy-MM-dd HH:mm:ss.SSS`, UTC); per-destination overridable with `.iso8601`.
+  - **Level style** — `.raw` | `.uppercase` (default) | `.paddedUppercase`. All 7 levels stay
+    distinct, **no collapsing**.
   - **Field selection + order** of `ts/level/label/category/thread/source/msg/metadata`. Source is
-    captured always, **rendered opt-in** (default off). Leading fields are emitted **by hand** in a
-    stable order (`String.logfmt` sorts keys alphabetically, so order can't rely on it); message +
-    metadata are appended via the one renderer.
+    captured and rendered by default. The default prefix is
+    `yyyy-MM-dd HH:mm:ss.SSS [BG|UI] LEVEL Type.function():line`; `Type` is derived from the source
+    filename. Leading fields are emitted **by hand** in a stable order (`String.logfmt` sorts keys
+    alphabetically, so order can't rely on it); message + metadata are appended via the one renderer.
   - **Category render style:** `category=mcp` (generic default) | **bare leading body token** (`mcp`,
     Muse's shape). Bare token shares the **body slot** with the message: category leads the body
     (`… File.func:line mcp foo=bar`), a message if present leads instead. `msg=` is omitted when
@@ -117,17 +118,17 @@ everything else formats through.
       description/case-name would silently drift the dotted ones. (Test: a `LogCategory` from
       `"database.connect"` renders the bare token exactly `database.connect`.)
   - **Sanitization is non-optional, baked in** (not a toggle).
-  - Default `ts` = **ISO8601 fractional seconds, UTC, `Z`-suffixed** (`2026-06-27T12:34:56.789Z`) via
-    **`Date.ISO8601FormatStyle`** (a `Sendable` value type — avoids the non-`Sendable`
-    `ISO8601DateFormatter` warning under complete concurrency). Output must be **byte-identical** to
-    `ISO8601DateFormatter` (`.withInternetDateTime` + `.withFractionalSeconds` + UTC `Z`) so existing
-    greps don't break — locked by a regression test.
+  - Default `ts` = **UTC with fractional seconds and no suffix**
+    (`2026-06-27 12:34:56.789`) via **`Date.ISO8601FormatStyle`** (a `Sendable` value type — avoids
+    the non-`Sendable` `ISO8601DateFormatter` warning under complete concurrency). The alternate
+    `.iso8601` output must be **byte-identical** to `ISO8601DateFormatter`
+    (`.withInternetDateTime` + `.withFractionalSeconds` + UTC `Z`) — locked by a regression test.
 - **Tests (all pure, no temp dir):** stable leading-field order; escaping/quoting via `String.logfmt`;
   sanitization strips `\r\n`/control chars from message **and** every metadata value; a record built on
   **main** formats `[UI]` even when formatted later off a background queue; `Error.loggingContext()`
   (nested `underlying_errors` array-of-dicts + a nil + a `CustomLogfmtStringConvertible` id) renders
   identically through the public entry and through `String.logfmt` directly; two configs render the
-  same record differently; the 24-char custom timestamp is exactly 24 chars as the leading field.
+  same record differently; the default timestamp is exactly 23 chars as the leading field.
   **Timestamp wire-format lock:** `ISO8601FormatStyle` byte-identical to `ISO8601DateFormatter` across
   ≥5 fractional cases (`.000`, `.050`, `.700`, `.999`, whole second) — proving always exactly 3
   fractional digits. **Timestamp perf benchmark:** 10k formats via `ISO8601FormatStyle` vs a cached
