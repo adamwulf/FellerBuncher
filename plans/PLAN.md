@@ -161,14 +161,20 @@ that drifts from `String.logfmt`.
   byte-identical output to Muse today (single renderer). The per-destination format variation is in
   the **leading scalar fields** (ts/level/label/category/thread/source/msg) + which appear, not in
   how the metadata serializes — so rendering the metadata fragment once is safe.
-  - **ASSUMPTION to confirm with muse-log-helper:** no destination needs to render a *subset* of
-    metadata keys or serialize the bag differently (the memory viewer "re-filters" by
-    level/category/text over the rendered line, it doesn't re-serialize metadata). If a destination
-    DID need per-key metadata selection, `LogRecord` would instead carry the structured bag wrapped
-    in a `Sendable` box rendered lazily — heavier; only if required.
+  - **CONFIRMED (muse-log-helper, with source evidence):** no Muse destination needs per-key metadata
+    subset rendering. All filters are whole-record keep-or-drop (`Filters.Message.excludes(...)` /
+    `.contains(...)` on category); the three destinations differ only in minLevel + whole-record
+    category filters + leading-field rendering. The in-app viewer regex-colors and substring-filters
+    over the already-rendered line; it never re-serializes metadata. So the single-fragment model is
+    correct: vary which whole records arrive + how leading fields render, NOT metadata serialization.
+  - **Forward-guard (put this AS A COMMENT at the `LogRecord` definition, not just here):**
+    *"metadata is pre-rendered to a single logfmt fragment; per-destination metadata-key selection is
+    intentionally NOT supported. If a future destination needs it, switch `LogRecord` to carry the
+    structured `[String: Any?]` bag in a `Sendable` box rendered lazily."* Keeps the constraint
+    visible at the data model so a later change can't silently violate it.
 - **Test:** `Error.loggingContext()` with nested `underlying_errors` (array of dicts) + a nil value
-  + a `CustomLogfmtStringConvertible` id renders **identically** through the bridge as through Muse's
-  current `String.logfmt` path.
+  + a `CustomLogfmtStringConvertible` id renders **identically** through the public entry as through
+  Muse's current `String.logfmt` path.
 
 ### 3.1a `LogCategory` (first-class routable field — muse-ios requirement)
 A lightweight wrapper over `String` (`struct LogCategory: Hashable, Sendable,
