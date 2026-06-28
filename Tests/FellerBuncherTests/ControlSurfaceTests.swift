@@ -205,22 +205,16 @@ func setGlobalLevelDuringFanOutIsAtomic() {
         globalLevel: .info
     )
     let torn = LockedBool()
-    let group = DispatchGroup()
-    let queue = DispatchQueue(
-        label: "FellerBuncherTests.global-level-race",
-        attributes: .concurrent
-    )
 
-    group.enter()
-    queue.async {
-        for index in 0..<5_000 {
-            registry.setGlobalLevel(index.isMultiple(of: 2) ? .debug : .info)
-        }
-        group.leave()
-    }
-    for _ in 0..<4 {
-        group.enter()
-        queue.async {
+    // Worker 0 flips the global level; workers 1...4 fan out and check that the
+    // level they observe is always a fully-applied value. Dedicated threads, not
+    // a shared concurrent queue, so this can't starve on a low-core CI runner.
+    let completed = runConcurrently(workers: 5) { index in
+        if index == 0 {
+            for iteration in 0..<5_000 {
+                registry.setGlobalLevel(iteration.isMultiple(of: 2) ? .debug : .info)
+            }
+        } else {
             for _ in 0..<5_000 {
                 let level = memory.filterConfig().minimumLevel
                 if level != .debug && level != .info {
@@ -228,11 +222,10 @@ func setGlobalLevelDuringFanOutIsAtomic() {
                 }
                 registry.fanOut(phase5Record("racing", level: .debug))
             }
-            group.leave()
         }
     }
 
-    #expect(group.wait(timeout: .now() + 10) == .success)
+    #expect(completed)
     #expect(!torn.value)
 }
 
@@ -320,26 +313,30 @@ func concurrentSetGlobalLevelKeepsGateAndDestinationsConsistent() {
         destinations: [pausable],
         globalLevel: .info
     )
-    let queue = DispatchQueue(
-        label: "FellerBuncherTests.det-setters",
-        attributes: .concurrent
-    )
     let aDone = DispatchSemaphore(value: 0)
     let bDone = DispatchSemaphore(value: 0)
 
+    // A and B run on dedicated threads so the deterministic interleaving the
+    // main thread orchestrates below can't be defeated by GCD pool starvation on
+    // a low-core CI runner.
+
     // A parks inside its fan-out (first setFilterConfig).
-    queue.async {
+    let threadA = Thread {
         registry.setGlobalLevel(.debug)
         aDone.signal()
     }
+    threadA.name = "FellerBuncherTests.det-setter-A"
+    threadA.start()
     pausable.waitUntilFirstSetterEntered()
 
     // B runs while A is parked. Under the fix it blocks on levelLock until A
     // finishes; under the bug it completes now (gate=.error, config=.error).
-    queue.async {
+    let threadB = Thread {
         registry.setGlobalLevel(.error)
         bDone.signal()
     }
+    threadB.name = "FellerBuncherTests.det-setter-B"
+    threadB.start()
     // Give B a beat to either complete (bug) or block on levelLock (fix).
     Thread.sleep(forTimeInterval: 0.05)
 
