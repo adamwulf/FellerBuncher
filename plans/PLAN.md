@@ -114,6 +114,13 @@ everything else formats through.
     category leads the body (`… File.func:line mcp foo=bar`), and if a message is present it leads
     instead/alongside. `msg=` is omitted entirely when there's no message (never `msg=""`).
     Muse's full field order (matchable via config): `ts [thread] LEVEL File.func:line CATEGORY pairs`.
+    - **Render `category.rawValue` verbatim — NEVER the Swift case name, `description`, or any
+      re-derivation.** Muse rawValues are hand-authored in the plist and several contain DOTS or
+      diverge from the case name (`.syncNetwork` → `sync_network`, `.databaseConnect` →
+      `database.connect`). Since `LogCategory` wraps the rawValue String, printing the wrapped String
+      is correct automatically; printing a description/case-name would silently drift the dotted ones.
+      (Test: a `LogCategory` from `"database.connect"` renders the bare token exactly
+      `database.connect` — dot preserved, no mangling.)
   - **Sanitization is non-optional, baked in** (not a formatter toggle).
   - Default `ts` = **ISO8601 fractional seconds, UTC, `Z`-suffixed** (`2026-06-27T12:34:56.789Z`) via
     **`Date.ISO8601FormatStyle`** (a `Sendable` value type — avoids the non-`Sendable`
