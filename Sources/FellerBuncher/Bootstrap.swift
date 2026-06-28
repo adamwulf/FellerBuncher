@@ -1,32 +1,47 @@
 import Foundation
 import Logging
 
-public final class LoggingHandle: Sendable {
-    public let fileDestination: FileDestination
-    public let memoryDestination: MemoryDestination?
-    public let registry: DestinationRegistry
-
-    init(
-        fileDestination: FileDestination,
-        memoryDestination: MemoryDestination?,
-        registry: DestinationRegistry
-    ) {
-        self.fileDestination = fileDestination
-        self.memoryDestination = memoryDestination
-        self.registry = registry
-    }
-
-    public var destinations: [any LogDestination] {
-        registry.snapshot()
-    }
-}
-
 private final class BootstrapState: @unchecked Sendable {
     let lock = NSLock()
     var handle: LoggingHandle?
+    var preConfigCoordinator: PreConfigCoordinator?
 }
 
 private let bootstrapState = BootstrapState()
+
+/// Installs a lightweight buffering handler **before** `bootstrap`, so logs
+/// emitted by `Logger(label:)`s created before bootstrap aren't lost. Records
+/// are held in a bounded drop-oldest ring and replayed (tagged `late=true`) into
+/// the real destinations once `bootstrap` runs.
+///
+/// This is the **single** `LoggingSystem.bootstrap` call: `bootstrap` later
+/// activates the same coordinator rather than bootstrapping again (swift-log
+/// crashes on a second bootstrap). Idempotent — a second install no-ops.
+public func installPreConfigCapture(
+    bufferCapacity: Int = defaultPreConfigBufferCapacity
+) {
+    bootstrapState.lock.lock()
+    defer { bootstrapState.lock.unlock() }
+
+    guard bootstrapState.preConfigCoordinator == nil,
+        bootstrapState.handle == nil
+    else {
+        return
+    }
+
+    let coordinator = PreConfigCoordinator(capacity: bufferCapacity)
+    bootstrapState.preConfigCoordinator = coordinator
+    LoggingSystem.bootstrap(
+        { label, metadataProvider in
+            PreConfigLogHandler(
+                label: label,
+                coordinator: coordinator,
+                metadataProvider: metadataProvider
+            )
+        },
+        metadataProvider: nil
+    )
+}
 
 @discardableResult
 public func bootstrap(
@@ -79,24 +94,35 @@ public func bootstrap(
     case (.none, .none):
         destinations = [fileDestination]
     }
-    let registry = DestinationRegistry(destinations: destinations)
+    let registry = DestinationRegistry(
+        destinations: destinations,
+        globalLevel: minimumLevel
+    )
 
     let handle = LoggingHandle(
         fileDestination: fileDestination,
         memoryDestination: memoryDestination,
         registry: registry
     )
-    LoggingSystem.bootstrap(
-        { label, metadataProvider in
-            FellerBuncherLogHandler(
-                label: label,
-                registry: registry,
-                minimumLevel: minimumLevel,
-                metadataProvider: metadataProvider
-            )
-        },
-        metadataProvider: nil
-    )
+
+    if let coordinator = bootstrapState.preConfigCoordinator {
+        // Pre-config capture already owns the single LoggingSystem.bootstrap.
+        // Switch it live and replay the buffered prefix tagged late=true; all
+        // loggers (pre- and post-bootstrap) route through it to this registry.
+        coordinator.activate(registry: registry)
+    } else {
+        LoggingSystem.bootstrap(
+            { label, metadataProvider in
+                FellerBuncherLogHandler(
+                    label: label,
+                    registry: registry,
+                    minimumLevel: minimumLevel,
+                    metadataProvider: metadataProvider
+                )
+            },
+            metadataProvider: nil
+        )
+    }
     bootstrapState.handle = handle
     return handle
 }

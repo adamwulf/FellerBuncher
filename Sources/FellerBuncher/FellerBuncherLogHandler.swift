@@ -11,9 +11,12 @@ public struct FellerBuncherLogHandler: LogHandler {
     public var metadata: Logger.Metadata
     public var logLevel: Logger.Level {
         get {
-            registry.hasForceIncludedCategories()
-                ? .trace
-                : configuredLogLevel
+            if registry.hasForceIncludedCategories() {
+                return .trace
+            }
+            // The global level is the shipping toggle ("Enable Debug Logging");
+            // a per-logger override only ever loosens the gate further.
+            return min(registry.globalLevel(), configuredLogLevel)
         }
         set {
             configuredLogLevel = newValue
@@ -62,14 +65,36 @@ public struct FellerBuncherLogHandler: LogHandler {
         )
             .flatMap(Self.stringValue)
             .map { LogCategory(rawValue: $0) } ?? LogCategory.default
-        guard event.level >= configuredLogLevel
+        let effectiveLevel = min(registry.globalLevel(), configuredLogLevel)
+        guard event.level >= effectiveLevel
             || registry.forceIncludes(bridgedCategory)
         else {
             return
         }
 
+        let record = Self.makeRecord(
+            label: label,
+            event: event,
+            handlerMetadata: metadata,
+            metadataProvider: metadataProvider
+        )
+
+        registry.fanOut(record)
+    }
+
+    /// Builds the immutable `LogRecord` from a swift-log event, folding the
+    /// metadata provider, handler metadata, and event metadata (plus the
+    /// category/fragment bridge and any event error) into one sanitized
+    /// fragment. Shared by the live handler and the pre-config capture buffer so
+    /// the two render byte-identically.
+    static func makeRecord(
+        label: String,
+        event: LogEvent,
+        handlerMetadata: Logger.Metadata,
+        metadataProvider: Logger.MetadataProvider?
+    ) -> LogRecord {
         var combinedMetadata = metadataProvider?.get() ?? [:]
-        combinedMetadata.merge(metadata) { _, handlerValue in handlerValue }
+        combinedMetadata.merge(handlerMetadata) { _, handlerValue in handlerValue }
         if let eventMetadata = event.metadata {
             combinedMetadata.merge(eventMetadata) { _, eventValue in eventValue }
         }
@@ -90,7 +115,7 @@ public struct FellerBuncherLogHandler: LogHandler {
             .joined(separator: " ")
         let message = event.message.description
 
-        let record = LogRecord(
+        return LogRecord(
             level: event.level,
             label: label,
             category: category,
@@ -100,8 +125,6 @@ public struct FellerBuncherLogHandler: LogHandler {
             function: event.function,
             line: event.line
         )
-
-        registry.fanOut(record)
     }
 
     public static func format(

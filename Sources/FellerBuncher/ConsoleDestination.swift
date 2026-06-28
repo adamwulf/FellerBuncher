@@ -88,6 +88,12 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
         }
     }
 
+    public func drain(completion: @escaping @Sendable () -> Void) {
+        queue.async {
+            completion()
+        }
+    }
+
     func drain() {
         queue.sync {}
     }

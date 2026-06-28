@@ -57,7 +57,8 @@ public struct LogRecord: Sendable {
         metadataFragment: String,
         file: String,
         function: String,
-        line: UInt
+        line: UInt,
+        thread: ThreadKind? = nil
     ) {
         self.timestamp = timestamp
         self.level = level
@@ -67,8 +68,30 @@ public struct LogRecord: Sendable {
         self.file = Self.sanitize(file)
         self.function = Self.sanitize(function)
         self.line = line
-        self.thread = Thread.isMainThread ? .main : .bg
+        self.thread = thread ?? (Thread.isMainThread ? .main : .bg)
         self.metadataFragment = metadataFragment
+    }
+
+    /// Returns a copy tagged `late=true`, preserving the original timestamp and
+    /// thread. Replayed pre-config records land physically after their
+    /// timestamps, so file order ≠ chronological for the replayed prefix;
+    /// `late=true` is the re-sort escape hatch.
+    func taggedLate() -> LogRecord {
+        let taggedFragment = metadataFragment.isEmpty
+            ? "late=true"
+            : "\(metadataFragment) late=true"
+        return LogRecord(
+            timestamp: timestamp,
+            level: level,
+            label: label,
+            category: category,
+            message: message,
+            metadataFragment: taggedFragment,
+            file: file,
+            function: function,
+            line: line,
+            thread: thread
+        )
     }
 
     static func renderMetadata(_ metadata: [String: Any?]) -> String {

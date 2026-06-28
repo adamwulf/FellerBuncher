@@ -39,6 +39,16 @@ public protocol LogDestination: AnyObject, Sendable {
     func shouldLog(_ record: LogRecord) -> Bool
     func receive(_ record: LogRecord)
     func tearDown(completion: @escaping @Sendable () -> Void)
+    /// Flushes any buffered records, calling `completion` once the destination's
+    /// pending work has drained. Non-blocking; safe from any thread.
+    func drain(completion: @escaping @Sendable () -> Void)
+}
+
+extension LogDestination {
+    /// In-memory destinations have nothing to flush; complete immediately.
+    public func drain(completion: @escaping @Sendable () -> Void) {
+        completion()
+    }
 }
 
 final class LockedFilterConfig: @unchecked Sendable {
