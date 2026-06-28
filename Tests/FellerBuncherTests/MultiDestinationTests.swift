@@ -206,32 +206,25 @@ func filterConfigIsAlwaysReadAsOneAtomicValue() {
         filterConfig: first
     )
     let invalidRead = LockedFlag()
-    let group = DispatchGroup()
-    let queue = DispatchQueue(
-        label: "FellerBuncherTests.filter-race",
-        attributes: .concurrent
-    )
 
-    group.enter()
-    queue.async {
-        for index in 0..<5_000 {
-            destination.setFilterConfig(index.isMultiple(of: 2) ? first : second)
-        }
-        group.leave()
-    }
-    for _ in 0..<4 {
-        group.enter()
-        queue.async {
+    // Worker 0 swaps the config; workers 1...4 read it. Each read must see one
+    // whole config, never a torn mix of the two. Dedicated threads, not a shared
+    // concurrent queue, so this can't starve on a low-core CI runner.
+    let completed = runConcurrently(workers: 5) { index in
+        if index == 0 {
+            for iteration in 0..<5_000 {
+                destination.setFilterConfig(iteration.isMultiple(of: 2) ? first : second)
+            }
+        } else {
             for _ in 0..<5_000 {
                 let snapshot = destination.filterConfig()
                 if snapshot != first && snapshot != second {
                     invalidRead.set()
                 }
             }
-            group.leave()
         }
     }
-    #expect(group.wait(timeout: .now() + 5) == .success)
+    #expect(completed)
     #expect(!invalidRead.value)
 }
 
@@ -252,38 +245,35 @@ func removalDuringWriteBurstDoesNotReopenClosedFile() throws {
         filterConfig: FilterConfig(minimumLevel: .trace)
     )
     let registry = DestinationRegistry(destinations: [files[0], memory])
-    let group = DispatchGroup()
-    let queue = DispatchQueue(
-        label: "FellerBuncherTests.teardown-race",
-        attributes: .concurrent
-    )
     let removalTimedOut = LockedFlag()
 
-    group.enter()
-    queue.async {
-        for index in 0..<500 {
-            registry.fanOut(phase4Record("\(index)"))
+    // Worker 0 bursts 500 records through the registry while worker 1 adds and
+    // removes file destinations underneath it. Dedicated threads, not a shared
+    // concurrent queue, so this can't starve on a low-core CI runner. The
+    // per-removal semaphore stays: `removeDestination`'s completion runs on the
+    // destination's own serial queue, which is never pool-starved.
+    let completed = runConcurrently(workers: 2) { index in
+        if index == 0 {
+            for record in 0..<500 {
+                registry.fanOut(phase4Record("\(record)"))
+            }
+        } else {
+            for (fileIndex, file) in files.enumerated() {
+                if fileIndex > 0 {
+                    registry.addDestination(file)
+                }
+                let removal = DispatchSemaphore(value: 0)
+                registry.removeDestination(file) {
+                    removal.signal()
+                }
+                if removal.wait(timeout: .now() + 5) == .timedOut {
+                    removalTimedOut.set()
+                }
+            }
         }
-        group.leave()
-    }
-    group.enter()
-    queue.async {
-        for (index, file) in files.enumerated() {
-            if index > 0 {
-                registry.addDestination(file)
-            }
-            let removal = DispatchSemaphore(value: 0)
-            registry.removeDestination(file) {
-                removal.signal()
-            }
-            if removal.wait(timeout: .now() + 5) == .timedOut {
-                removalTimedOut.set()
-            }
-        }
-        group.leave()
     }
 
-    #expect(group.wait(timeout: .now() + 5) == .success)
+    #expect(completed)
     #expect(!removalTimedOut.value)
     #expect(memory.snapshot().count == 500)
     for file in files {
