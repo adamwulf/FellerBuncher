@@ -31,6 +31,15 @@ and handed over the decisions below. They are accepted as the foundation.
    synchronous and non-async, so an actor would force `await` hops that cannot be made from
    inside `log()`. Destinations that do I/O are classes guarding all mutable state behind a
    private serial queue, marked `@unchecked Sendable` (sound because state is queue-confined).
+6. **Dependency direction: libraries depend on swift-log only; the app depends on FellerBuncher.**
+   (log-helper's key insight.) A library/engine that wants to log imports only `Logging` and emits
+   plain `Logger(label:)` values — it does NOT depend on FellerBuncher. Those loggers route to
+   whatever backend was bootstrapped: the file/fan-out when the app is running, swift-log's default
+   stderr under `swift test` with no bootstrap. Only the **app (or a single composition-root
+   module)** depends on FellerBuncher and calls `bootstrap` to install the destination fan-out.
+   This keeps every library dependency-light (no file-writer/exporter/container machinery dragged
+   in) and makes `LogDestination`s an **app-composition concern** — the exact seam SwiftyBeaver's
+   `addDestination` occupies, so the muse-ios migration maps cleanly.
 
 ### Boundary table
 
@@ -109,12 +118,14 @@ Pure function `LogRecord -> String` (one line, newline-terminated). Responsibili
   Collapsing `notice→info` would throw away a level a consumer deliberately chose. (Q3)
 - `ts=` format: **ISO8601 with fractional seconds, UTC, `Z`-suffixed** →
   `ts=2026-06-27T12:34:56.789Z`. Sortable (lexical == chronological) + human-readable. (Q4)
-  - Use a single `static let ISO8601DateFormatter` configured **once** in its initializer
-    (`[.withInternetDateTime, .withFractionalSeconds]`, `timeZone = UTC`) and **never
-    mutated**. `string(from:)` is then safe to call concurrently from many logging threads
-    (true since iOS 13 / macOS 10.15). Pin UTC explicitly so logs from different zones sort
-    and correlate. Making it a `var` or reconfiguring per-call reintroduces the classic
-    NSDateFormatter data race.
+  - **Use `Date.ISO8601FormatStyle` (Sendable value type), NOT `ISO8601DateFormatter`.** Going
+    Swift 6 / complete-concurrency from day one (see §4.2), a `static let ISO8601DateFormatter`
+    (non-Sendable) warns; the format style sidesteps it entirely and is the right modern choice.
+    Configure `.year().month().day()...`/`includingFractionalSeconds: true` with `timeZone: .gmt`
+    (or the `ISO8601FormatStyle(...)` initializer with fractional seconds + UTC). Pin UTC
+    explicitly so logs from different zones sort and correlate.
+  - log-helper's reference used a frozen `static let ISO8601DateFormatter` (safe under their 5.9
+    baseline because configure-once-never-mutate); we improve on it with the value-type style.
 
 ### 3.3 `LogDestination` (protocol)
 ```
@@ -240,17 +251,43 @@ log.debug(…) / log.warning(…) / log.error(…)
   API is synchronous and fire-and-forget, `bootstrap(...)` is synchronous, and the convenience
   sugar is synchronous. A pre-concurrency / non-async call site can use the entire logging path
   without ever entering an `async` context. This is the default and the goal.
-- **Where an API genuinely must do async work** (the only realistic candidates: the deferred
-  log **export/zip**, and **`flush()`/drain** for graceful shutdown or tests), provide **THREE**
-  shapes of the same operation so no caller is forced into `async`:
-  1. **Synchronous** where it can block safely (e.g. `flush()` via `queue.sync {}` — test/shutdown only).
-  2. **Callback / completion-handler** variant — `func export(..., completion: @escaping @Sendable (Result<URL, Error>) -> Void)` — for pre-concurrency callers and Objective-C-ish call sites.
-  3. **async/await** variant — `func export(...) async throws -> URL` — typically a thin
-     `withCheckedThrowingContinuation` wrapper over the callback form, so the two never diverge.
+- **The write path stays fire-and-forget sync.** `write(line)` does `queue.async { performWrite }`;
+  the caller (swift-log's sync `log()`) never blocks and never awaits. This is exactly why the
+  serial-queue-class-not-actor choice pays off — it satisfies Adam's "no async in the public
+  interface" for free. (log-helper confirmed this was 100% synchronous end-to-end in production.)
+- **The ONE genuine dual-API surface is `drain`/`flush`** (export is deferred). Provide three shapes:
+  1. **Sync `flush()` = `queue.sync {}`** — a barrier that blocks until all prior enqueued writes
+     (and init-time prune/open) drain. **Test / known-safe-thread use only.** Document the two
+     hazards: calling `queue.sync` from the **main thread** at shutdown risks a priority-inversion
+     stall if the writer is mid-large-write; and you must **never** `queue.sync` from inside an
+     `async` context (it blocks a cooperative thread-pool thread — a Swift-concurrency no-no).
+  2. **Callback form (source of truth):** `func drain(completion: @escaping @Sendable () -> Void)`
+     implemented as `queue.async { completion() }` — enqueues a no-op AFTER all pending writes and
+     fires when reached. Non-blocking, safe from anywhere (main thread, async context). This is the
+     production shutdown/pre-export call.
+  3. **async form derived from #2:** `func drain() async { await withCheckedContinuation { c in
+     drain { c.resume() } } }`. `drain` doesn't throw → plain `withCheckedContinuation`. Reserve the
+     **throwing** continuation (`withCheckedThrowingContinuation`) for `export` if/when it lands.
 - **Implementation rule:** write the callback form as the source of truth; derive the `async`
   form from it via a continuation. One code path, two surfaces — they can't drift.
 - The internal `DispatchQueue`-confined writer stays as-is (no actors — gotcha N3); the
   async surface is only a wrapper at the public boundary, never in the hot logging path.
+
+### 4.2 Swift 6 / complete concurrency (build clean from day one)
+This is a fresh reusable package, so target **Swift 6 language mode / `-strict-concurrency=complete`
+from the start** — do NOT inherit log-helper's 5.9-no-strict baseline (the one place their package
+is behind where ours should be). The two friction points and their fixes (from log-helper):
+- **(a) The `[String: Any]` logfmt bag** in `format(...)` is not Sendable. Keep it strictly **local**:
+  build and consume it inside the one synchronous function, and pass only the **already-formatted
+  `String`** (Sendable) into `write()`. Never let the `Any` bag escape into the `queue.async` closure.
+- **(b) `ISO8601DateFormatter` is not Sendable**, so a `static let` of it warns under complete
+  checking. **Use `Date.ISO8601FormatStyle` instead** (a Sendable value type) — it sidesteps the
+  warning entirely and is the right choice when targeting Swift 6 from day one. (Fallback only if a
+  format gap appears: `nonisolated(unsafe) static let`, justified by configure-once-never-mutate.)
+- **(c) No workaround needed for swift-log composition:** `StreamLogHandler` / `MultiplexLogHandler`
+  are already `Sendable` in 1.14, and the `LogHandler` protocol is `Sendable` (which is *why* our
+  custom handler — and the writer it captures — must be `Sendable`; hence `@unchecked` on the
+  queue-confined writer, the canonical, non-smell use of `@unchecked`).
 
 ---
 
