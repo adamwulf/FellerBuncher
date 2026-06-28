@@ -358,6 +358,15 @@ Design rule: the **`LogRecord` + registry is the real ingestion point**; the swi
 is just *one* producer of records. The closure bridge is another producer. Don't couple ingestion
 to swift-log exclusively.
 
+**This multiple-producers shape is UNCONDITIONAL** (confirmed by muse-log-helper) — it ships day-one
+regardless of whether LogDriver/SwiftToolbox ever migrate to native swift-log, because other closure
+producers exist permanently: the closed-source SDKs (Setapp, Sparkle) slave their level to ours via
+their own setters, and the Sentry error path is fed the same way. The closure bridge is **not
+build-to-discard**; it stays for the closed SDKs even after the two in-house packages go native. So:
+build registry-with-co-equal-producers now; the only open scope question (Adam's call) is *when*
+LogDriver/SwiftToolbox migrate, which only moves tasks between this effort and a follow-up — it does
+not change the architecture.
+
 ### 3.11 Non-file destinations as proof the design generalizes (muse-ios Finding #3b)
 Muse forks **error-level** records to **Sentry** (`SentrySDK.capture`) with typed context mapped
 (e.g. `QualifiedId.hexString`) and file/func/line as extras. This is just another `LogDestination`:
@@ -469,8 +478,11 @@ plans/PLAN.md                       # this file
   `2026-06-27 12:34:56.789` as the leading field (no `ts=` prefix) so the viewer's `0..<24` gray-out holds.
 - `.size` rotation: file rolls at the size threshold; rotated siblings shift correctly.
 - `.size` rotation fallback: simulated rename failure → truncate-in-place, size bound held.
-- **`.dateStamped` rotation:** filename embeds UTC date; poll-and-swap rolls at the UTC day boundary;
-  a "next-day" launch opens a fresh dated file without the process being alive at midnight.
+- **`.dateStamped` rotation:** filename embeds UTC date; the swap is driven by **"today's computed
+  filename differs from the open file's name,"** NOT by a timer assuming the app was alive at midnight.
+  - **Cold-launch-after-day-boundary (muse-log-helper's locked test):** simulate a launch at e.g. 2pm
+    the day *after* the last write — the first write must open the new dated file, with **nothing lost
+    to yesterday's file**. This is the failure mode poll-and-swap exists to prevent.
 - Pruning: by count and by age; **active file is never pruned** (gotcha E); per-directory only.
 - Bootstrap idempotency: second `bootstrap` call is a safe no-op (no trap).
 - **preConfigLogs replay:** records emitted before bootstrap replay into destinations tagged `late=true`.
@@ -527,3 +539,14 @@ categories (app-owned enum), the logfmt context contract with self-rendering typ
 4. **Test:** suite per §6 with injected temp dir.
 5. **Review cycle** (log-helper: generic A–F + Swift-6; muse-log-helper: muse-ios reality), then
    offer as the muse-ios SwiftyBeaver replacement.
+
+**Muse cutover sequencing (muse-log-helper's recommendation — Adam's scope call, pending):**
+- Land FellerBuncher in Muse via the **closure bridge first, with ZERO behavior change** to
+  LogDriver/SwiftToolbox. The Muse cutover is already big on its own (SwiftyBeaver→FellerBuncher under
+  Muse's facade, re-implement MemoryDestination on our protocol, port the snapshot runtime toggle +
+  daily dated rotation, wire SentryDestination, preserve the 24-char wire format). Prove the log files
+  + support bundles + in-app viewer + Sentry are byte-for-byte as expected.
+- **THEN**, as a separate follow-up, migrate LogDriver/SwiftToolbox to native swift-log — observable
+  change is only "same records arrive via a different producer." "Slow is smooth, smooth is fast."
+- Architecture is identical either way; the scope decision only moves the two package-migration tasks
+  between this effort and a follow-up. (Build the registry/co-equal-producers shape unconditionally.)
