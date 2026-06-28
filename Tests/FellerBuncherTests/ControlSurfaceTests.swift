@@ -253,6 +253,106 @@ private final class LockedBool: @unchecked Sendable {
     }
 }
 
+/// A destination that pauses inside the FIRST `setFilterConfig` call until the
+/// test releases it, so the test can deterministically force the problematic
+/// interleaving: setter A parked mid-fan-out while setter B runs to completion.
+private final class PausableConfigDestination: LogDestination, @unchecked Sendable {
+    private let lock = NSLock()
+    private var config: FilterConfig
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private var armed = true
+
+    init(config: FilterConfig) {
+        self.config = config
+    }
+
+    /// Blocks until the first `setFilterConfig` has entered (A is inside its
+    /// fan-out under the atomic fix, or past the gate write under the bug).
+    func waitUntilFirstSetterEntered() {
+        entered.wait()
+    }
+
+    /// Lets the parked first setter finish writing.
+    func releaseFirstSetter() {
+        release.signal()
+    }
+
+    func filterConfig() -> FilterConfig {
+        lock.lock()
+        defer { lock.unlock() }
+        return config
+    }
+
+    func setFilterConfig(_ config: FilterConfig) {
+        lock.lock()
+        let shouldPause = armed
+        if armed { armed = false }
+        lock.unlock()
+
+        if shouldPause {
+            entered.signal()
+            release.wait()
+        }
+
+        lock.lock()
+        self.config = config
+        lock.unlock()
+    }
+
+    func shouldLog(_ record: LogRecord) -> Bool { filterConfig().shouldLog(record) }
+    func receive(_ record: LogRecord) {}
+    func tearDown(completion: @escaping @Sendable () -> Void) { completion() }
+}
+
+/// Concurrent setters must not leave a durable gate-vs-destination mismatch.
+/// Deterministically forces: setter A (→ .debug) parked mid-fan-out, setter B
+/// (→ .error) runs fully, then A resumes. Under a non-atomic setGlobalLevel A's
+/// late config write leaves config=.debug while gate=.error — a durable
+/// mismatch. Under the lock-held-across-fan-out fix, B blocks on levelLock until
+/// A completes, so gate and config both end at the last committed level.
+@Test
+func concurrentSetGlobalLevelKeepsGateAndDestinationsConsistent() {
+    let pausable = PausableConfigDestination(
+        config: FilterConfig(minimumLevel: .info)
+    )
+    let registry = DestinationRegistry(
+        destinations: [pausable],
+        globalLevel: .info
+    )
+    let queue = DispatchQueue(
+        label: "FellerBuncherTests.det-setters",
+        attributes: .concurrent
+    )
+    let aDone = DispatchSemaphore(value: 0)
+    let bDone = DispatchSemaphore(value: 0)
+
+    // A parks inside its fan-out (first setFilterConfig).
+    queue.async {
+        registry.setGlobalLevel(.debug)
+        aDone.signal()
+    }
+    pausable.waitUntilFirstSetterEntered()
+
+    // B runs while A is parked. Under the fix it blocks on levelLock until A
+    // finishes; under the bug it completes now (gate=.error, config=.error).
+    queue.async {
+        registry.setGlobalLevel(.error)
+        bDone.signal()
+    }
+    // Give B a beat to either complete (bug) or block on levelLock (fix).
+    Thread.sleep(forTimeInterval: 0.05)
+
+    // Release A; it finishes writing config=.debug.
+    pausable.releaseFirstSetter()
+
+    #expect(aDone.wait(timeout: .now() + 5) == .success)
+    #expect(bDone.wait(timeout: .now() + 5) == .success)
+
+    // Quiescent invariant: the gate and the destination config must agree.
+    #expect(pausable.filterConfig().minimumLevel == registry.globalLevel())
+}
+
 // MARK: - preConfigLogs replay
 
 @Test

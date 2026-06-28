@@ -81,6 +81,10 @@ final class PreConfigCoordinator: @unchecked Sendable {
         buffer.removeAll(keepingCapacity: false)
         lock.unlock()
 
+        // A live `ingest` arriving after the unlock but before this replay
+        // finishes fans out immediately, so it can land physically before the
+        // older replayed prefix. No record is lost or duplicated (the lock
+        // serializes the nil-check/append/swap); `late=true` is the re-sort hatch.
         for record in pending {
             registry.fanOut(record.taggedLate())
         }

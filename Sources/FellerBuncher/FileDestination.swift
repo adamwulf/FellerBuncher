@@ -57,6 +57,11 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     /// file; for `.dateStamped` it is the queue-confined active file (the one
     /// actually open), so it honors the injected clock and reflects the latest
     /// date roll rather than re-deriving a name from the wall clock.
+    ///
+    /// - Warning: For a `.dateStamped` destination this reads through the serial
+    ///   queue with `queue.sync`. Do **not** call it from inside a `drain` or
+    ///   `tearDown` completion (those run on this destination's own queue) — it
+    ///   would deadlock. Read it before scheduling the drain, or off the queue.
     public var fileURL: URL {
         switch rotationPolicy {
         case .none, .size:

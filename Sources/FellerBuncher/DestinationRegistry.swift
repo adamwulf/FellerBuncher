@@ -26,10 +26,17 @@ public final class DestinationRegistry: @unchecked Sendable {
         return globalLevelValue
     }
 
-    /// Writes `level` into the global gate and into **every** destination's
-    /// `FilterConfig` (atomically per destination), then notifies observers on
-    /// the calling thread. A destination added afterward inherits the level via
-    /// `addDestination`.
+    /// Writes `level` into the global gate **and** into every destination's
+    /// `FilterConfig`, then notifies observers on the calling thread. The gate
+    /// write and the per-destination fan-out happen under `levelLock` as one
+    /// unit, so two concurrent setters can't leave a durable gate-vs-destination
+    /// mismatch. A destination added afterward inherits the level via
+    /// `addDestination` (also under `levelLock`).
+    ///
+    /// Lock-ordering: `levelLock` is held while calling `snapshot()` (the
+    /// registry `lock`) and `setFilterConfig` (the per-destination filter lock).
+    /// Neither of those re-enters `levelLock`, and no path acquires `lock`
+    /// before `levelLock`, so the nesting introduces no cycle.
     public func setGlobalLevel(_ level: Logger.Level) {
         let observers: [(Logger.Level) -> Void]
         let changed: Bool
@@ -38,13 +45,12 @@ public final class DestinationRegistry: @unchecked Sendable {
         changed = globalLevelValue != level
         globalLevelValue = level
         observers = levelObservers
-        levelLock.unlock()
-
         for destination in snapshot() {
             var config = destination.filterConfig()
             config.minimumLevel = level
             destination.setFilterConfig(config)
         }
+        levelLock.unlock()
 
         if changed {
             for observer in observers {
@@ -77,10 +83,13 @@ public final class DestinationRegistry: @unchecked Sendable {
             return
         }
 
-        // A destination added after a `setGlobalLevel` call inherits the level.
+        // Inherit the global level under `levelLock` so this can't race a
+        // concurrent `setGlobalLevel` into a lost update on the new destination.
+        levelLock.lock()
         var config = destination.filterConfig()
-        config.minimumLevel = globalLevel()
+        config.minimumLevel = globalLevelValue
         destination.setFilterConfig(config)
+        levelLock.unlock()
     }
 
     public func removeDestination(
