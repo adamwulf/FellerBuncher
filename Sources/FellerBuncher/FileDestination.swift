@@ -2,9 +2,18 @@ import Dispatch
 import Foundation
 import OSLog
 
+/// The cadence at which a `.dateStamped` active file rolls to a fresh file.
+public enum DateGranularity: Sendable, Equatable {
+    case day
+}
+
 public enum RotationPolicy: Sendable, Equatable {
     case none
     case size(bytes: UInt64)
+    /// The active filename embeds the date (`<name>-yyyy-MM-dd.log` for `.day`)
+    /// in `zone` (default UTC). Rolls at the boundary by computed-filename-differs
+    /// — no timer, no numbered siblings; pruning is purely age-based.
+    case dateStamped(granularity: DateGranularity = .day, zone: TimeZone = .gmt)
 }
 
 public enum PruneDate: Sendable, Equatable {
@@ -19,8 +28,11 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     public static let retention: TimeInterval = 7 * 24 * 60 * 60
 
     public let logDirectory: URL
-    public let fileURL: URL
     public let formatter: LogfmtFormatter
+
+    /// The base name component (`<name>.log`). For `.dateStamped` the active file
+    /// embeds the date instead; read `fileURL` for the live target.
+    private let baseURL: URL
 
     private let processName: String
     private let rotationPolicy: RotationPolicy
@@ -31,12 +43,32 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     private let queue: DispatchQueue
     private let filter: LockedFilterConfig
     private let degradationLogger: Logger
+    /// Injectable clock so tests can simulate a cold launch on a later day.
+    private let now: @Sendable () -> Date
 
     // Every mutable property below is confined to `queue`.
     private var fileHandle: FileHandle?
+    private var activeFileURL: URL
     private var currentSize: UInt64
     private var lastPruneDate: Date?
     private var closed = false
+
+    /// The currently-targeted file. For `.size`/`.none` this is the fixed base
+    /// file; for `.dateStamped` it is the dated file for the current date.
+    public var fileURL: URL {
+        switch rotationPolicy {
+        case .none, .size:
+            return baseURL
+        case .dateStamped(let granularity, let zone):
+            return Self.datedFileURL(
+                logDirectory: logDirectory,
+                processName: processName,
+                date: Date(),
+                granularity: granularity,
+                zone: zone
+            )
+        }
+    }
 
     public init(
         logDirectory: URL,
@@ -47,11 +79,12 @@ public class FileDestination: LogDestination, @unchecked Sendable {
         retention: TimeInterval = FileDestination.retention,
         pruneInterval: TimeInterval = FileDestination.pruneInterval,
         pruneDate: PruneDate = .contentModificationDate,
-        filterConfig: FilterConfig = .init()
+        filterConfig: FilterConfig = .init(),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) throws {
         let safeProcessName = Self.safeProcessName(processName)
         self.logDirectory = logDirectory
-        self.fileURL = logDirectory.appendingPathComponent("\(safeProcessName).log")
+        self.baseURL = logDirectory.appendingPathComponent("\(safeProcessName).log")
         self.processName = safeProcessName
         self.formatter = formatter
         self.rotationPolicy = rotationPolicy
@@ -61,28 +94,46 @@ public class FileDestination: LogDestination, @unchecked Sendable {
         self.pruneDate = pruneDate
         self.queue = DispatchQueue(label: "FellerBuncher.FileDestination.\(safeProcessName)")
         self.filter = LockedFilterConfig(filterConfig)
+        self.now = now
         self.degradationLogger = Logger(
             subsystem: "FellerBuncher",
             category: "writer"
         )
+
+        // Resolve the initial active file: a cold launch the day after the last
+        // write opens the fresh dated file, never reopening yesterday's.
+        let initialURL: URL
+        switch rotationPolicy {
+        case .none, .size:
+            initialURL = baseURL
+        case .dateStamped(let granularity, let zone):
+            initialURL = Self.datedFileURL(
+                logDirectory: logDirectory,
+                processName: safeProcessName,
+                date: now(),
+                granularity: granularity,
+                zone: zone
+            )
+        }
+        self.activeFileURL = initialURL
 
         let fileManager = FileManager.default
         try fileManager.createDirectory(
             at: logDirectory,
             withIntermediateDirectories: true
         )
-        if !fileManager.fileExists(atPath: fileURL.path) {
-            guard fileManager.createFile(atPath: fileURL.path, contents: nil) else {
+        if !fileManager.fileExists(atPath: initialURL.path) {
+            guard fileManager.createFile(atPath: initialURL.path, contents: nil) else {
                 throw CocoaError(.fileWriteUnknown)
             }
         }
 
-        let handle = try FileHandle(forWritingTo: fileURL)
+        let handle = try FileHandle(forWritingTo: initialURL)
         self.currentSize = try handle.seekToEnd()
         self.fileHandle = handle
 
         queue.async { [self] in
-            pruneIfNeeded(at: Date(), force: true)
+            pruneIfNeeded(at: self.now(), force: true)
         }
     }
 
@@ -107,6 +158,9 @@ public class FileDestination: LogDestination, @unchecked Sendable {
             guard !closed else {
                 return
             }
+            // Date rotation is by computed-filename-differs, checked cheaply on
+            // every write so the first write after midnight opens the new file.
+            rollIfDateChangedLocked(now: now())
             let line = formatter.format(record) + "\n"
             guard let data = line.data(using: .utf8) else {
                 return
@@ -117,10 +171,23 @@ public class FileDestination: LogDestination, @unchecked Sendable {
                 currentSize += UInt64(data.count)
             } catch {
                 degradationLogger.error(
-                    "write failed path=\(self.fileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    "write failed path=\(self.activeFileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
                 )
             }
-            pruneIfNeeded(at: Date(), force: false)
+            pruneIfNeeded(at: now(), force: false)
+        }
+    }
+
+    /// An idempotent date-roll the app may poke on any cadence (no package
+    /// timer). A no-op unless the computed filename for `now` differs from the
+    /// currently-open file. Runs on the serial queue, so it is ordered against
+    /// writes and pruning.
+    public func rollIfDateChanged() {
+        queue.async { [self] in
+            guard !closed else {
+                return
+            }
+            rollIfDateChangedLocked(now: now())
         }
     }
 
@@ -164,6 +231,49 @@ public class FileDestination: LogDestination, @unchecked Sendable {
         try FileManager.default.moveItem(at: source, to: destination)
     }
 
+    /// Rolls the active file to the dated file for `now` when the computed name
+    /// differs from the open one. No-op for `.size`/`.none` and when the date is
+    /// unchanged. Must run on `queue`.
+    private func rollIfDateChangedLocked(now: Date) {
+        guard case .dateStamped(let granularity, let zone) = rotationPolicy else {
+            return
+        }
+        let target = Self.datedFileURL(
+            logDirectory: logDirectory,
+            processName: processName,
+            date: now,
+            granularity: granularity,
+            zone: zone
+        )
+        guard target.standardizedFileURL != activeFileURL.standardizedFileURL else {
+            return
+        }
+
+        try? fileHandle?.synchronize()
+        try? fileHandle?.close()
+        fileHandle = nil
+
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: target.path) {
+            guard fileManager.createFile(atPath: target.path, contents: nil) else {
+                degradationLogger.error(
+                    "date roll create failed path=\(target.path, privacy: .public)"
+                )
+                return
+            }
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: target)
+            currentSize = try handle.seekToEnd()
+            fileHandle = handle
+            activeFileURL = target
+        } catch {
+            degradationLogger.error(
+                "date roll open failed path=\(target.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
     private func rotateIfNeeded(forAdditionalBytes additionalBytes: UInt64) {
         guard case .size(let maximumBytes) = rotationPolicy else {
             return
@@ -184,15 +294,15 @@ public class FileDestination: LogDestination, @unchecked Sendable {
             try fileHandle?.close()
             fileHandle = nil
             try shiftRotatedFiles()
-            try moveItem(at: fileURL, to: rotatedFileURL(index: 1))
-            guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
+            try moveItem(at: activeFileURL, to: rotatedFileURL(index: 1))
+            guard FileManager.default.createFile(atPath: activeFileURL.path, contents: nil) else {
                 throw CocoaError(.fileWriteUnknown)
             }
-            fileHandle = try FileHandle(forWritingTo: fileURL)
+            fileHandle = try FileHandle(forWritingTo: activeFileURL)
             currentSize = 0
         } catch {
             degradationLogger.error(
-                "rotation move failed path=\(self.fileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                "rotation move failed path=\(self.activeFileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
             reopenAndTruncateActiveFile()
         }
@@ -222,14 +332,14 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     private func reopenAndTruncateActiveFile() {
         do {
             if fileHandle == nil {
-                fileHandle = try FileHandle(forWritingTo: fileURL)
+                fileHandle = try FileHandle(forWritingTo: activeFileURL)
             }
             try fileHandle?.truncate(atOffset: 0)
             try fileHandle?.seek(toOffset: 0)
             currentSize = 0
         } catch {
             degradationLogger.error(
-                "truncate fallback failed path=\(self.fileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                "truncate fallback failed path=\(self.activeFileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
             fileHandle = nil
             currentSize = 0
@@ -256,7 +366,10 @@ public class FileDestination: LogDestination, @unchecked Sendable {
             return
         }
 
-        let activePath = fileURL.standardizedFileURL.path
+        // The skip-active guard reads the queue-confined active file, so for
+        // `.dateStamped` it recomputes today's name each sweep (never pruning
+        // the file currently open).
+        let activePath = activeFileURL.standardizedFileURL.path
         for candidate in files {
             guard candidate.standardizedFileURL.path != activePath else {
                 continue
@@ -282,6 +395,11 @@ public class FileDestination: LogDestination, @unchecked Sendable {
             }
         }
 
+        // `.dateStamped` has no numbered siblings; its pruning is purely
+        // age-based above. `.size`/`.none` keep the numbered-sibling count cap.
+        if case .dateStamped = rotationPolicy {
+            return
+        }
         pruneExcessRotatedFiles()
     }
 
@@ -319,5 +437,34 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     private static func safeProcessName(_ processName: String) -> String {
         let candidate = URL(fileURLWithPath: processName).lastPathComponent
         return candidate.isEmpty ? "process" : candidate
+    }
+
+    /// `<dir>/<name>-yyyy-MM-dd.log` for `date` in `zone` (`.day` granularity).
+    /// Uses `Date.ISO8601FormatStyle` (a `Sendable` value type) to avoid the
+    /// non-`Sendable` `DateFormatter` warning under complete concurrency.
+    static func datedFileURL(
+        logDirectory: URL,
+        processName: String,
+        date: Date,
+        granularity: DateGranularity,
+        zone: TimeZone
+    ) -> URL {
+        let stamp = dateStamp(for: date, granularity: granularity, zone: zone)
+        return logDirectory.appendingPathComponent("\(processName)-\(stamp).log")
+    }
+
+    static func dateStamp(
+        for date: Date,
+        granularity: DateGranularity,
+        zone: TimeZone
+    ) -> String {
+        switch granularity {
+        case .day:
+            let style = Date.ISO8601FormatStyle(
+                dateSeparator: .dash,
+                timeZone: zone
+            ).year().month().day()
+            return style.format(date)
+        }
     }
 }

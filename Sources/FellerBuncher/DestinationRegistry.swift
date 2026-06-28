@@ -1,21 +1,86 @@
 import Foundation
+import Logging
 
 public final class DestinationRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var destinations: [any LogDestination]
 
-    public init(destinations: [any LogDestination] = []) {
+    /// The global minimum level. It is the source of truth for the handler gate
+    /// and is mirrored into every destination's `FilterConfig` by `setGlobalLevel`.
+    private let levelLock = NSLock()
+    private var globalLevelValue: Logger.Level
+    private var levelObservers: [(Logger.Level) -> Void] = []
+
+    public init(
+        destinations: [any LogDestination] = [],
+        globalLevel: Logger.Level = .info
+    ) {
         self.destinations = destinations
+        self.globalLevelValue = globalLevel
+    }
+
+    /// The effective global minimum level (the handler gate).
+    public func globalLevel() -> Logger.Level {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        return globalLevelValue
+    }
+
+    /// Writes `level` into the global gate and into **every** destination's
+    /// `FilterConfig` (atomically per destination), then notifies observers on
+    /// the calling thread. A destination added afterward inherits the level via
+    /// `addDestination`.
+    public func setGlobalLevel(_ level: Logger.Level) {
+        let observers: [(Logger.Level) -> Void]
+        let changed: Bool
+
+        levelLock.lock()
+        changed = globalLevelValue != level
+        globalLevelValue = level
+        observers = levelObservers
+        levelLock.unlock()
+
+        for destination in snapshot() {
+            var config = destination.filterConfig()
+            config.minimumLevel = level
+            destination.setFilterConfig(config)
+        }
+
+        if changed {
+            for observer in observers {
+                observer(level)
+            }
+        }
+    }
+
+    /// Registers an observer fired (on the setter's thread) when the global
+    /// level changes. Returns the current level so a fresh observer can sync up.
+    @discardableResult
+    func addLevelObserver(_ observer: @escaping (Logger.Level) -> Void) -> Logger.Level {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        levelObservers.append(observer)
+        return globalLevelValue
     }
 
     public func addDestination(_ destination: any LogDestination) {
         let identifier = ObjectIdentifier(destination)
         lock.lock()
-        defer { lock.unlock() }
-        guard !destinations.contains(where: { ObjectIdentifier($0) == identifier }) else {
+        let alreadyRegistered = destinations.contains {
+            ObjectIdentifier($0) == identifier
+        }
+        if !alreadyRegistered {
+            destinations.append(destination)
+        }
+        lock.unlock()
+        guard !alreadyRegistered else {
             return
         }
-        destinations.append(destination)
+
+        // A destination added after a `setGlobalLevel` call inherits the level.
+        var config = destination.filterConfig()
+        config.minimumLevel = globalLevel()
+        destination.setFilterConfig(config)
     }
 
     public func removeDestination(
