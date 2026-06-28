@@ -126,6 +126,10 @@ Pure function `LogRecord -> String` (one line, newline-terminated). Responsibili
     explicitly so logs from different zones sort and correlate.
   - log-helper's reference used a frozen `static let ISO8601DateFormatter` (safe under their 5.9
     baseline because configure-once-never-mutate); we improve on it with the value-type style.
+  - **Byte-identical requirement:** the format-style output MUST exactly match the
+    `ISO8601DateFormatter` shape (`.withInternetDateTime` + `.withFractionalSeconds` + UTC `Z`) —
+    same fractional-digit count, separators, and `Z` suffix — so the Sendable switch doesn't change
+    the wire format and break existing greps/tooling. Locked by a regression test (see §6).
 
 ### 3.3 `LogDestination` (protocol)
 ```
@@ -313,6 +317,12 @@ plans/PLAN.md                       # this file
 
 ## 6. Test plan (inject a temp dir — never touch real containers)
 - logfmt formatting: stable leading-field order; correct escaping/quoting via String.logfmt.
+- **Timestamp wire-format lock (regression guard):** assert `Date.ISO8601FormatStyle` output is
+  **byte-identical** to `ISO8601DateFormatter` with `[.withInternetDateTime, .withFractionalSeconds]`
+  + UTC `Z` for a fixed sample date (e.g. exactly `2026-06-27T12:34:56.789Z`: same fractional-digit
+  count, same separators, same `Z` suffix). The Sendable switch (§3.2/§4.2) must NOT silently change
+  the wire format, or existing logfmt greps/tooling break. (log-helper flagged this as the one place
+  the format could drift.)
 - Sanitization: `\r\n` + control chars stripped from message AND every metadata value.
 - Rotation: file rolls at the size threshold; rotated files shift correctly.
 - Rotation fallback: simulated rename failure → truncate-in-place, size bound held.
