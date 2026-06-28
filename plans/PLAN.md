@@ -14,6 +14,13 @@ marked `PENDING` and must be resolved before the affected component is built.
 These come from the `log-helper` agent, who shipped a near-identical package (GuessWhoLogging)
 and handed over the decisions below. They are accepted as the foundation.
 
+> **Triangulated across THREE real consumers:** GuessWho (log-helper), muse-ios (muse-log-helper),
+> and EssentialMCP (interviewed via log-helper) — all swift-log + a custom logfmt file handler. The
+> boundary below is where all three converge. Notable cross-consumer confirmations: per-process file
+> keying (not per-label/per-day — EssentialMCP's per-day was incidental), category as a first-class
+> conformable field (Muse + EssentialMCP), a runtime global level override as a *shipping user feature*
+> (EssentialMCP), and non-optional newline sanitization (GuessWho + EssentialMCP both hit gotcha D).
+
 1. **Consumers use swift-log's `Logger` directly. No facade type.** The package owns only
    (a) a one-call bootstrap and (b) the `LogHandler` factory. Anyone who knows swift-log
    already knows this API. A custom logging type would fight muscle memory and re-implement
@@ -50,10 +57,10 @@ and handed over the decisions below. They are accepted as the foundation.
 | In-memory ring buffer + coalesced change hook | ✅ memory destination | ✅ sets callback |
 | Console / OSLog mirroring | ✅ console destination | — |
 | `LogDestination` protocol + runtime registry | ✅ | ✅ add/remove, custom dests |
-| `LogCategory` (the field type) | ✅ | — |
-| The category ENUM + its plist codegen | — | ✅ (240 values, app-specific) |
+| `LogCategory` field + conformable category sugar (RawRepresentable<String>) | ✅ | ✅ conforms its enum |
+| The category ENUM + its plist codegen | — | ✅ (app-specific build phase) |
 | One-call bootstrap + idempotency + preConfigLogs replay | ✅ | — |
-| `effectiveLevel` accessor + change callback | ✅ | ✅ pushes to closed SDKs |
+| **Global level override** (`setGlobalLevel`/`effectiveLevel` readback) | ✅ set/get | ✅ persists the toggle, pushes to closed SDKs |
 | Dynamic-level entry `custom(level:)` (closure path) | ✅ | ✅ calls it from its closure |
 | Routing existing closures in | ✅ doc/pattern only (no type) | ✅ app closure calls the public API |
 | Eager thread capture (`ThreadKind`) | ✅ at construction | — |
@@ -176,17 +183,24 @@ that drifts from `String.logfmt`.
   + a `CustomLogfmtStringConvertible` id renders **identically** through the public entry as through
   Muse's current `String.logfmt` path.
 
-### 3.1a `LogCategory` (first-class routable field — muse-ios requirement)
+### 3.1a `LogCategory` (first-class routable field — confirmed by muse-ios AND EssentialMCP)
 A lightweight wrapper over `String` (`struct LogCategory: Hashable, Sendable,
 ExpressibleByStringLiteral { let rawValue: String }`). The package does **not** own any category
-enum — Muse codegen's its ~240-value enum from a plist; the app maps it in by raw value (and via
-`.other(String)` escape hatch on their side). Category is used three ways:
+enum — both Muse and EssentialMCP codegen theirs from a `MuseLog.plist` build phase; that stays the
+app's build concern. Category is used three ways:
 - **Destination routing key:** per-destination include-set / exclude-set are sets of `LogCategory`.
   A typed field means filters are set membership, not hot-path dict-lookup-then-string-compare.
 - **Optional wire-format field:** destinations may render `category=…` in their line.
 - **OSLog `category:`** for the console/OSLog destination: one `os.Logger(subsystem: <constant app
   bundle id>, category: record.category.rawValue)`, cached per category (Muse builds ~240 once). Keyed
   on `record.category`, NOT `record.label` (Nit B) — this is how Console.app filtering works for Muse.
+
+**Conformable, not just literal (EssentialMCP load-bearing #2):** the category-taking sugar accepts
+**any `RawRepresentable where RawValue == String`**, so an app conforms its generated enum and writes
+`logger.info(.mcp, …)` with the enum's `rawValue` becoming the category token. The package vends the
+small acceptance point; the app's enum + its plist codegen stay the app's. (Accepted ranking from
+EssentialMCP: conformable protocol PREFERRED > plain strings acceptable > package owning codegen = NO.
+Value is brevity + a closed, discoverable, same-spelling-everywhere set — not primarily type-safety.)
 
 It must be cheap to omit: a `Logger`-only consumer that never supplies a category gets a default
 (e.g. derived from `label`, or a sentinel `.default`), so the swift-log-direct path is unaffected.
@@ -205,13 +219,20 @@ line (newline-terminated). It is still a pure `LogRecord -> String` function, bu
     timestamp (no `ts=` key prefix) to preserve the 24-char offset. → cover with a test.
 - **Level style:** `.raw` (default — `level.rawValue`) | `.paddedUppercase` (Muse memory uses
   `$-5L`-style padding). All 7 levels stay distinct, no collapsing (Q3).
-- **Field selection + order:** which of `ts/level/label/category/source/msg/metadata` appear.
+- **Field selection + order:** which of `ts/level/label/category/thread/source/msg/metadata` appear.
+  - **Source attribution (`file:line`/function) is OPT-IN per destination** (EssentialMCP: lightly
+    used eyeball aid). swift-log hands us `file/function/line` free via the `LogEvent`, so we always
+    *capture* it on `LogRecord`; whether a destination *renders* it is a formatter field, default OFF
+    (keeps lines lean; available when wanted).
 - Shared invariants regardless of config:
 - Emit **fixed leading fields by hand** in a stable order (e.g. `ts=… level=… label=… category=…`)
   (`String.logfmt` sorts keys alphabetically, so we cannot rely on it for field order — gotcha C).
 - Append the message + metadata by handing **one dict** to `String.logfmt` (`["msg": …, …meta]`).
-- Sanitize: strip `\r`/`\n` and other control chars from the message and every metadata value
-  before formatting, so one record is always exactly one line (gotcha D).
+- **Sanitize (NON-OPTIONAL, baked in — not a toggle):** strip `\r`/`\n` and other control chars from
+  the message and every metadata value before formatting, so one record is always exactly one line
+  (gotcha D). **Confirmed load-bearing by TWO independent codebases:** GuessWho hit it; EssentialMCP
+  verified their FileLogHandler does NOT sanitize today and multi-line `error.localizedDescription`
+  IS splitting records across physical lines right now. Two real codebases = default-on, no opt-out.
 - `level=` tokens: emit `level.rawValue` directly — all 7 distinct, **no collapsing**
   (`trace debug info notice warning error critical`). `grep 'level=error'` just works.
   Collapsing `notice→info` would throw away a level a consumer deliberately chose. (Q3)
@@ -233,30 +254,52 @@ line (newline-terminated). It is still a pure `LogRecord -> String` function, bu
 
 ### 3.3 `LogDestination` (protocol) + the mutable registry
 ```
+struct FilterConfig: Sendable {              // the {level, include, exclude} triple, swapped atomically
+    var minimumLevel: Logger.Level
+    var includeCategories: Set<LogCategory>? // nil = all; non-nil = ONLY these
+    var excludeCategories: Set<LogCategory>  // always dropped (e.g. ephemeral_update)
+    // forceIncludeCategories: Set<LogCategory>  // admit below the gate (hot-subsystem tracing)
+}
 protocol LogDestination: AnyObject, Sendable {
-    var id: ObjectIdentifier { get }              // for removeDestination
-    var minimumLevel: Logger.Level { get }
-    var includeCategories: Set<LogCategory>? { get } // nil = all; non-nil = ONLY these
-    var excludeCategories: Set<LogCategory> { get }  // always dropped (e.g. ephemeral_update)
-    func shouldLog(_ record: LogRecord) -> Bool   // level + category include/exclude + force-include
-    func receive(_ record: LogRecord)             // must be cheap / non-blocking for caller
+    func filterConfig() -> FilterConfig          // read the WHOLE triple atomically (R1)
+    func setFilterConfig(_ c: FilterConfig)      // write the WHOLE triple atomically (R1)
+    func shouldLog(_ record: LogRecord) -> Bool  // computed from a single atomic filterConfig() read
+    func receive(_ record: LogRecord)            // cheap / non-blocking for caller; enqueues
+    func tearDown(completion: @escaping @Sendable () -> Void)  // drain-then-close ON the dest's queue (R2)
 }
 ```
 - **Per-destination filtering** (the crux for muse-ios): level + category **include-set** AND
   **exclude-set**, both keyed on the typed `LogCategory`. Main file excludes `ephemeral_update`;
-  the snapshot file includes only its ~15 categories.
-- **Force-include for below-level tracing:** `shouldLog` may accept a record *below* the global
-  level when its category/source matches a per-destination allowlist (Muse's always-on tracing of
-  hot subsystems like `AsyncBoardRenderer`, `SnapshotTileProvider`).
+  the snapshot file includes only its ~15. Plus **force-include** to admit a record *below* the gate
+  when its category/source matches a per-destination allowlist (Muse's always-on hot-subsystem
+  tracing of `AsyncBoardRenderer`, `SnapshotTileProvider`).
+- **R1 — the mutable filter config is read OFF the destination's queue (the hot fan-out path) but
+  MUTATED from another thread (setGlobalLevel). It is NOT queue-confined, so the plain
+  `@unchecked Sendable` "all state is queue-confined" argument does NOT cover it — that's a real
+  torn-read race (a level change racing a fan-out).** Fix: store the `{level, include, exclude,
+  forceInclude}` as a **single `FilterConfig` value behind one lock** (`os_unfair_lock`/`NSLock`),
+  read+swapped as a whole so level and categories can never tear relative to each other. `shouldLog`
+  takes ONE `filterConfig()` snapshot and decides from it. (The file HANDLE stays queue-confined; the
+  FILTER CONFIG gets its own lock. These are two different synchronization domains — see §4.2 (d).)
+- **R2 — teardown must run ON the destination's OWN serial queue, never on the caller/registry thread.**
+  Because the registry copies the list under its lock then fans out *outside* it (correct, non-blocking),
+  a destination can be removed after it's captured in a fan-out snapshot but before its `receive()`
+  runs. If `removeDestination` closed the FileHandle synchronously off-queue, a late `receive()` would
+  enqueue a write onto a queue whose handle is closing → crash / lost write. So `tearDown` does
+  `queue.async { drain; close }`; a late `receive()` is then ordered either **before** the close (it
+  writes — fine) or **after** (queue sees `handle == nil`, no-ops via the existing degraded-write path).
 - Each destination is a **class** (so Muse can conform its own `MemoryDestination` with a custom
   `receive`/send, replacing their SwiftyBeaver `BaseDestination` subclass) and holds its own
   `LogfmtFormatter` config.
 
-**`DestinationRegistry` (runtime-mutable):** the handler fans out to a lock-guarded mutable set of
+**`DestinationRegistry` (runtime-mutable):** the handler fans out to a lock-guarded mutable list of
 destinations supporting `addDestination(_:)` / `removeDestination(_:)` at runtime with no relaunch
-(Muse's `FeatureFlagChanged` observer toggles the snapshot `FileDestination` live). The lock is
-held only to copy the current destination list; fan-out happens outside the lock so a slow
-destination can't block registration. This is the seam that maps SwiftyBeaver's `addDestination`.
+(Muse's `FeatureFlagChanged` observer toggles the snapshot `FileDestination` live). The registry lock
+is held ONLY to copy the current list; fan-out happens outside it so a slow destination can't block
+registration. `removeDestination` removes from the list under the lock, then calls the destination's
+`tearDown(completion:)` (which closes on its own queue — R2). `removeDestination(_:)` keys on
+`ObjectIdentifier(destination)` computed registry-side (destinations are `AnyObject`), so conformers
+don't store an id (N3). This is the seam that maps SwiftyBeaver's `addDestination`.
 
 ### 3.4 `FileDestination` (the gnarly one)
 Class, private serial `DispatchQueue`, `@unchecked Sendable`. Writes formatted lines to
@@ -287,6 +330,11 @@ timestamp; the snapshot file is a second instance with its own include-set).
   prune coordination (Q-D: the zip step just *collects* both dirs read-only). Prune date field is
   configurable: log-helper uses `contentModificationDate`, Muse uses `creationDate` (3-week cutoff,
   matters for date-stamped files that are written-then-idle).
+  - **N1 — under `.dateStamped` the "active file" is DYNAMIC** (today's computed dated name, which
+    changes at the day boundary), not a constant `app.log`. The skip-active guard must recompute the
+    active URL each sweep, and a prune racing the poll-and-swap must not target the file just rolled
+    from — both run on the destination's serial queue so they're ordered, and the guard compares
+    against the *current* computed active name, not a cached one.
 - **Defaults (Q1):**
   - `maxFileBytes = 10 MB` per active file (`.size` policy)
   - `rotatedFilesToKeep = 5` (`app-1.log` … `app-5.log`; oldest dropped) → worst case ≈ 60 MB/process
@@ -303,10 +351,16 @@ Fixed-capacity ring buffer of recent `LogRecord`s behind a small lock, **O(1) dr
 default capacity **5000** (Muse's cap; configurable). Stores structured `LogRecord`s (not pre-
 formatted lines) so the in-app viewer can re-filter and render lazily with its own formatter config.
 - **Change-notification hook (Q-B decided):** a single coalesced `@Sendable () -> Void` callback
-  (`onChange`) the viewer sets on appear / nils on disappear. The destination does its own
-  coalescing (a needs-refresh gate) so a burst of logs yields one UI refresh. No Combine /
-  async-stream / multi-observer needed (Muse uses exactly one observer); a single callback +
-  coalescing is what they have and is sufficient.
+  (`onChange`) the viewer sets on appear / nils on disappear. No Combine / async-stream / multi-observer
+  (Muse uses exactly one observer).
+  - **Thread contract (R3): `onChange` is delivered ON MAIN** (`DispatchQueue.main.async` inside the
+    coalescing). The only consumer is a SwiftUI/UIKit viewer; mutating view state off-main is undefined
+    behavior, so main-delivery is the safer default for this specific destination. Documented.
+  - **Coalescing must avoid the lost-wakeup race (R4).** NAIVE (buggy): set `dirty=true`; schedule;
+    the fire reads+clears `dirty` — a log arriving between read and clear clears unseen data → dropped
+    final refresh. CORRECT: under the lock, `dirty=true`; `if !scheduled { scheduled=true; dispatch }`.
+    In the dispatched block: under the lock, `scheduled=false`, capture+clear `dirty`, then fire — so a
+    log during the fire re-arms a fresh schedule. (Test: N logs → ≥1 refresh AND a refresh AFTER the last log.)
 - Peer destination with its **own** min-level + category filters + formatter (Muse's memory format
   differs from file: local time, padded level).
 
@@ -318,6 +372,10 @@ Dev-time visibility. Expose a **`ConsoleMode` enum: `.osLog` (default) / `.stder
   NOT `label` — Nit B). Muse pre-builds ~240 such loggers; we cache lazily on first use per category.
   This is a genuinely better default than stderr when consumers live in Xcode/Console.app — proper
   level coloring, subsystem/category filtering, shows in the unified log.
+  - **Cache must be bounded (N4).** A closed category set (Muse's ~240) is fine, but the `.other(String)`
+    escape hatch is open-cardinality — caching an `os.Logger` per arbitrary string could grow unbounded.
+    Either cap the cache (LRU) or only cache known/low-cardinality categories and build-on-the-fly for
+    `.other`. Low risk, but bound it.
   - **Gotcha:** `os_log` redacts interpolated values as `<private>` by default. Emit the line
     with `privacy: .public` (`%{public}s`) — safe because we control + already sanitize the
     formatting, so nothing sensitive is added by making it public.
@@ -374,6 +432,11 @@ in `FileDestination` (Q1), except retention which is a param (the two consumers 
   startup logs are never lost even though `Logger(label:)` binds its handler at construction
   (gotcha B). We still recommend bootstrapping early, but replay removes the silent-data-loss
   failure mode. (The bootstrap-first rule stays the documented happy path; replay is the safety net.)
+  - **N2 — define overflow + ordering:** the buffer is bounded with **drop-oldest** overflow (an
+    early-startup log storm has defined, non-OOM behavior). Replayed `late=true` lines land physically
+    later in the file than their (earlier) timestamps — i.e. **file line order != chronological for the
+    replayed prefix.** This is fine and standard; documented so nobody "fixes" it. The `late=true` tag
+    is the escape hatch for a chronological re-sort if ever needed.
 - **Synchronous startup**: bootstrap is fully synchronous and the file/dir is ready before it
   returns, so the first log after bootstrap is guaranteed to land.
 
@@ -381,25 +444,45 @@ in `FileDestination` (Q1), except retention which is a param (the two consumers 
 - `addDestination(_:)` / `removeDestination(_:)` — runtime registry mutation (Muse's feature-flag
   snapshot toggle). `removeDestination` drains the destination before teardown (covers Q-C's
   `flush(secondTimeout:)` use without needing a separate timeout API).
-- **`effectiveLevel` (get) + `onEffectiveLevelChange` callback (muse-ios "single sink"):** so the
-  app can push level changes into **closed SDKs** (Setapp, Sparkle) whose own level setters Muse
-  slaves to the logger's level. Setting the level updates the handler(s) and fires the callback.
+- **Global level override — set-all + readback (EssentialMCP load-bearing #1):**
+  - `setGlobalLevel(_:)` — **sets the `minimumLevel` in every registered destination's `FilterConfig`
+    (via its atomic `setFilterConfig`, R1) AND the handler gate** (R8 — EssentialMCP cranks their FILE
+    to `.debug`, so the level must reach the *destinations*, not only the handler). A destination added
+    *after* the override inherits the current global level. This backs a **shipping USER feature**
+    ("Enable Debug Logging" toggle), NOT just a debug affordance — distinct from compile-time
+    DEBUG/RELEASE console gating. (This global write is exactly the cross-thread filter-config mutation
+    R1 makes safe.)
+  - `effectiveLevel` (get) — a **global readback** so a settings toggle reflects current state on
+    appear, and so the app can push the level into **closed SDKs** (Setapp/Sparkle) whose own setters
+    it slaves to ours (muse-ios "single sink").
+  - **Persistence-friendly, not persisting:** the app stores the toggle and re-asserts it at startup;
+    the package only set/get. (Per-destination `minLevel` still exists for fine routing; this is the
+    global crank over all of them.)
+  - `onEffectiveLevelChange` fires when the global level changes (for the closed-SDK push). **Thread
+    contract (R3): delivered on the thread that called `setGlobalLevel`** — the app hops to main itself
+    if its SDK setter requires it. Chosen over forcing a main hop so a non-UI consumer isn't made to
+    thread-switch. Documented loudly.
 - `drain(...)` (sync / callback / async per §4.1) — also exposed for dependency-driven flush
   (Muse wires `LogContext.flushLog = { handle.drain {} }`).
 
 ### 3.9 `Logger` convenience extensions (the only "facade-ish" sugar — feature #5)
-swift-log's native metadata API is verbose. Add ergonomic helpers:
+swift-log's native metadata API is verbose. Ship **two orthogonal, composable sugars** (EssentialMCP
+wants both; they don't conflict):
 ```
-log.info("wrote", ["bytes": n, "path": url])     // vs swift-log's .stringConvertible boilerplate
+log.info("wrote", ["bytes": n, "path": url])     // (1) metadata-dict overload (GuessWho)
+log.info(.mcp, "started", ["port": p])           // (2) category overload (EssentialMCP) — .mcp is the app's enum
 log.debug(…) / log.warning(…) / log.error(…)
-log.custom(level: lvl, …)                        // DYNAMIC level — required by the closure path (§3.10)
+log.custom(level: lvl, .mcp, "msg", […])         // DYNAMIC level — the closure path (§3.10)
 ```
-- **Dynamic-level entry (required):** alongside the four fixed-level helpers, expose
-  `custom(level:category:_:metadata:file:function:line:)` taking `level` as a runtime value. This is
-  what an app's existing closure-based logger calls from inside its closure (the closure receives
-  `level` at runtime). Mirrors Muse's `log.custom(level:…)`. Without it, the only dynamic-level path
-  is swift-log's `Logger.log(level:_:metadata:source:)` — fine, but the sugar should offer parity.
-- All helpers also accept an optional `category:` so the closure path can supply it.
+- **(1) Metadata-dict overload (GuessWho):** `[String: Any?]` rendered through the same one
+  `String.logfmt` path (below).
+- **(2) Category overload (EssentialMCP):** takes any `RawRepresentable where RawValue == String`
+  (§3.1a) so `log.info(.mcp, …)` works with the app's generated enum; the rawValue becomes the
+  category token. Orthogonal to (1) — a call can supply category, message, AND a metadata dict.
+- **Dynamic-level entry (required for the closure path):** `custom(level:category:_:metadata:file:
+  function:line:)` taking `level` as a runtime value (an app's closure receives `level` at runtime).
+  Mirrors Muse's `log.custom(level:…)`. Alternative is swift-log's `Logger.log(level:_:metadata:source:)`.
+- All fixed-level helpers also accept an optional `category:`.
 - Take a `[String: Any?]` bag rendered through the **same `String.logfmt` path** as the closure
   bridge (Nit A) — NOT a separate `[String: CustomStringConvertible]` renderer. One renderer for
   both producers means the sugar and the bridge can't drift (the in-miniature version of Finding 2).
@@ -505,6 +588,15 @@ is behind where ours should be). The two friction points and their fixes (from l
   are already `Sendable` in 1.14, and the `LogHandler` protocol is `Sendable` (which is *why* our
   custom handler — and the writer it captures — must be `Sendable`; hence `@unchecked` on the
   queue-confined writer, the canonical, non-smell use of `@unchecked`).
+- **(d) THE MUTABLE FILTER CONFIG read off-queue (R1) — the third friction point, NOT just (a)+(b).**
+  `@unchecked Sendable` is only sound for state that's genuinely confined to one synchronization
+  domain. The file handle is queue-confined; but `{minimumLevel, include/exclude/forceInclude}` is
+  **read on the producer's thread during `shouldLog` (off the destination's queue)** and **written by
+  `setGlobalLevel` from another thread**. That's a real torn-read data race and an unsound
+  `@unchecked` claim if left implicit. Fix: a single `FilterConfig` value behind its own
+  lock (`os_unfair_lock`/`NSLock`), read+swapped whole (§3.3). So a destination has TWO
+  synchronization domains — the serial queue (handle/writes) and the filter lock (config) — both
+  documented, neither relying on the other. ThreadSanitizer must be clean on a level-flip-during-burst.
 
 ---
 
@@ -535,12 +627,20 @@ plans/PLAN.md                       # this file
 
 ## 6. Test plan (inject a temp dir — never touch real containers)
 - logfmt formatting: stable leading-field order; correct escaping/quoting via String.logfmt.
-- **Timestamp wire-format lock (regression guard):** assert `Date.ISO8601FormatStyle` output is
-  **byte-identical** to `ISO8601DateFormatter` with `[.withInternetDateTime, .withFractionalSeconds]`
-  + UTC `Z` for a fixed sample date (e.g. exactly `2026-06-27T12:34:56.789Z`: same fractional-digit
-  count, same separators, same `Z` suffix). The Sendable switch (§3.2/§4.2) must NOT silently change
-  the wire format, or existing logfmt greps/tooling break. (log-helper flagged this as the one place
-  the format could drift.)
+- **Timestamp wire-format lock (regression guard, R5 — MULTIPLE fractional values, not one):** assert
+  `Date.ISO8601FormatStyle` output is **byte-identical** to `ISO8601DateFormatter` with
+  `[.withInternetDateTime, .withFractionalSeconds]` + UTC `Z` across **at least 5 cases**: `.000`
+  (does one emit `…56.000Z` and the other `…56Z`?), `.050` (leading-zero fraction), `.700` (trailing
+  zero kept?), `.999`, and a whole second — proving BOTH always emit exactly 3 fractional digits.
+  This is the precise drift risk (FormatStyle dropping trailing-zero fractions or emitting 6 digits on
+  some OS breaks every fixed-width/24-char-anchored grep silently). The Sendable switch must NOT change
+  the wire format.
+- **Timestamp hot-path perf (R6, measurement gate):** micro-benchmark formatting 10k timestamps via
+  `Date.ISO8601FormatStyle` vs a cached `ISO8601DateFormatter`. **Decision rule:** if the value-type
+  style is materially slower (Muse logs inline in hot render/ink paths, and force-include tracing means
+  hot records DO get formatted even when the global gate is high), fall back to
+  `nonisolated(unsafe) static let ISO8601DateFormatter` — perf is the TRIGGER, gated on a measured
+  number, not aesthetics.
 - Sanitization: `\r\n` + control chars stripped from message AND every metadata value.
 - **Eager thread capture (Finding 1):** a record built on the **main thread** formats as `[UI]` even
   when the destination writes it from its **background** queue (proves `Thread.isMainThread` is
@@ -570,7 +670,20 @@ plans/PLAN.md                       # this file
   **force-include** admits a below-global-level record for an allowlisted category/source.
 - **Runtime registry:** add/removeDestination mid-stream changes where subsequent records land;
   removeDestination drains before teardown.
-- **effectiveLevel:** changing it updates the handler and fires `onEffectiveLevelChange`.
+- **Global level override (R8):** `setGlobalLevel(.debug)` flips the minimumLevel on **every**
+  registered destination AND the handler gate; `effectiveLevel` getter returns the new global value;
+  `onEffectiveLevelChange` fires. A destination added *after* the override inherits the current level.
+- **Filter-config atomicity (R1):** a `setGlobalLevel` concurrent with a fan-out never produces a torn
+  read of {level, include, exclude} — run a stress test flipping level while a burst logs, assert no
+  record is admitted/dropped against a half-applied config (ThreadSanitizer clean).
+- **removeDestination vs in-flight fan-out (R2):** removeDestination concurrent with a write burst
+  loses nothing and never writes to a closed handle (close is enqueued on the destination's own queue).
+- **Callback thread contracts (R3):** `MemoryDestination.onChange` is delivered on main;
+  `onEffectiveLevelChange` is delivered on the setter's calling thread (documented).
+- **onChange coalescing (R4):** N logs yield ≥1 refresh, and at least one refresh happens AFTER the
+  last log (no lost-wakeup); a log arriving during the fire re-arms a fresh schedule.
+- **Category sugar conformance (R7):** an app enum `enum Cat: String { case mcp }` conformed to
+  `LogCategoryConvertible` works in `log.info(.mcp, …)` with **zero per-call `.init(rawValue:)`**.
 - Memory destination: ring buffer caps at 5000, O(1) drop-oldest; snapshot in order; coalesced onChange fires.
 - **Closure path:** a record produced by calling `custom(level:category:metadata:…)` (as an app's
   closure would) lands in the registry identically to one from the swift-log handler — and a dynamic
