@@ -13,6 +13,7 @@ import Logging
 /// Because the coordinator is a reference shared by every handler copy (existing
 /// and future), `LoggingSystem.bootstrap` is called **once** — the pre-config
 /// install — and never again, avoiding swift-log's second-bootstrap crash.
+
 /// The default number of pre-bootstrap records retained for replay.
 public let defaultPreConfigBufferCapacity = 1_000
 
@@ -101,7 +102,12 @@ public struct PreConfigLogHandler: LogHandler {
     public var metadata: Logger.Metadata = [:]
     public var logLevel: Logger.Level {
         get { coordinator.effectiveLevel() }
-        set { /* the global level is authoritative; per-logger overrides no-op */ }
+        // The global level is authoritative here. Unlike the live
+        // FellerBuncherLogHandler (which loosens its gate with a per-logger
+        // override via min(global, configured)), the pre-config path
+        // intentionally ignores per-logger overrides — it is the transitional
+        // bootstrap handler, gated only by the global level.
+        set {}
     }
 
     public let label: String

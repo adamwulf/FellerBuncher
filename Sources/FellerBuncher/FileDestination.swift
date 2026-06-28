@@ -54,19 +54,15 @@ public class FileDestination: LogDestination, @unchecked Sendable {
     private var closed = false
 
     /// The currently-targeted file. For `.size`/`.none` this is the fixed base
-    /// file; for `.dateStamped` it is the dated file for the current date.
+    /// file; for `.dateStamped` it is the queue-confined active file (the one
+    /// actually open), so it honors the injected clock and reflects the latest
+    /// date roll rather than re-deriving a name from the wall clock.
     public var fileURL: URL {
         switch rotationPolicy {
         case .none, .size:
             return baseURL
-        case .dateStamped(let granularity, let zone):
-            return Self.datedFileURL(
-                logDirectory: logDirectory,
-                processName: processName,
-                date: Date(),
-                granularity: granularity,
-                zone: zone
-            )
+        case .dateStamped:
+            return queue.sync { activeFileURL }
         }
     }
 

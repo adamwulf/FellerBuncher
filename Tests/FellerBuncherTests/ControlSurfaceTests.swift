@@ -416,6 +416,32 @@ func rollIfDateChangedIsIdempotentAndPokeable() throws {
 }
 
 @Test
+func dateStampedFileURLReflectsActiveFileAfterRoll() throws {
+    let directory = try makeControlTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let day1 = Date(timeIntervalSince1970: 1_782_621_952) // 2026-06-28 UTC
+    let day2 = day1.addingTimeInterval(24 * 60 * 60)       // 2026-06-29 UTC
+    let clock = MutableClock(day1)
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "url-app",
+        rotationPolicy: .dateStamped(granularity: .day, zone: .gmt),
+        filterConfig: FilterConfig(minimumLevel: .trace),
+        now: clock.now
+    )
+    defer { tearDownFile(destination) }
+
+    // fileURL names the actually-open file, honoring the injected clock.
+    #expect(destination.fileURL.lastPathComponent == "url-app-2026-06-28.log")
+
+    clock.advance(to: day2)
+    destination.rollIfDateChanged()
+    drainFile(destination)
+    #expect(destination.fileURL.lastPathComponent == "url-app-2026-06-29.log")
+}
+
+@Test
 func coldLaunchAfterDayBoundaryOpensNewDatedFile() throws {
     let directory = try makeControlTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -486,6 +512,38 @@ func handleDrainFlushesEveryDestination() throws {
 
     let contents = try String(contentsOf: file.fileURL, encoding: .utf8)
     #expect(contents.contains("msg=flush-me"))
+}
+
+@Test
+func removeDestinationDrainsRecordEnqueuedJustBeforeTeardown() throws {
+    let directory = try makeControlTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let file = try FileDestination(
+        logDirectory: directory,
+        processName: "remove-drain-app",
+        rotationPolicy: .none,
+        filterConfig: FilterConfig(minimumLevel: .trace)
+    )
+    let registry = DestinationRegistry(destinations: [file], globalLevel: .trace)
+    let handle = LoggingHandle(
+        fileDestination: file,
+        memoryDestination: nil,
+        registry: registry
+    )
+
+    // Fan a record, then immediately remove: tearDown drains (FIFO on the
+    // serial queue) before closing, so the record must reach disk.
+    registry.fanOut(phase5Record("last-gasp"))
+    let removed = DispatchSemaphore(value: 0)
+    handle.removeDestination(file) {
+        removed.signal()
+    }
+    #expect(removed.wait(timeout: .now() + 2) == .success)
+
+    let contents = try String(contentsOf: file.fileURL, encoding: .utf8)
+    #expect(contents.contains("msg=last-gasp"))
+    #expect(registry.snapshot().isEmpty)
 }
 
 // MARK: - Test scaffolding

@@ -104,6 +104,9 @@ public final class DestinationRegistry: @unchecked Sendable {
             completion()
             return
         }
+        // tearDown runs drain+close on the destination's own serial queue, so
+        // every prior `receive` is flushed (FIFO) before the close — this is the
+        // "drain before teardown" the plan calls for, satisfied by queue order.
         removed.tearDown(completion: completion)
     }
 
