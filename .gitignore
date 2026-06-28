@@ -1,0 +1,4 @@
+.codex/
+.build/
+.swiftpm/
+AGENTS.md

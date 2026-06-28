@@ -1,0 +1,24 @@
+{
+  "originHash" : "ee0f8e8f26c329af673de23f1911ea488a4fe3b96c03db8878daaf03e34d9255",
+  "pins" : [
+    {
+      "identity" : "logfmt",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/adamwulf/Logfmt.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "a6d6eb29177f65f3e252610a2176d318026d634c"
+      }
+    },
+    {
+      "identity" : "swift-log",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-log.git",
+      "state" : {
+        "revision" : "a878e7f8f46cfc0e1125e565b5c08e7d5272dc9a",
+        "version" : "1.14.0"
+      }
+    }
+  ],
+  "version" : 3
+}
