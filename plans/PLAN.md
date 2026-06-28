@@ -166,21 +166,64 @@ everything else formats through.
 
 ### Phase 3 — Ergonomic helpers
 **Goal:** the convenient call sites. Completes the original five concerns.
-- **Two orthogonal, composable sugars** on the real `Logger` (additive, not a replacement type):
-  1. **metadata-dict** `log.info("wrote", ["bytes": n])` — `[String: Any?]`.
-  2. **category** `log.info(.mcp, "started", ["port": p])` — any `RawRepresentable<String>`.
-  - Plus `debug/info/warning/error` and **`custom(level:category:_:metadata:file:function:line:)`**
-    with `level` as a **runtime value** (the dynamic-level entry).
-- All sugar renders its `[String: Any?]` bag through the **same `String.logfmt` renderer** as the
-  closure path (one renderer → sugar and bridge can't drift), eagerly on the calling thread. Forward
-  `file/function/line`.
-- **Routing existing closure-based loggers is a doc note, not a type:** an app's own closure body
-  calls the public `custom(level:category:_:metadata:)` directly, mapping its runtime `level` and
-  handing `context` as the metadata bag. The dynamic-level entry above is the only affordance this
-  requires.
-- **Tests:** sugar and the closure path produce identical bytes for the same bag; `custom(level:)`
-  routes a dynamic level correctly; an app `enum Cat: String` conformed to `LogCategoryConvertible`
-  works in `log.info(.mcp, …)` with no per-call `.init(rawValue:)`; `file/function/line` forwarded.
+
+**`message` is always a distinct argument — it is NOT folded into the metadata dict.** This is the
+key contract decision. The message maps to logfmt's distinguished `msg=` field (every line is
+`ts=… level=… msg="…" key=val …`), it mirrors swift-log's own `info(_ message:, metadata:)` shape, and
+it matches the real consumers' facades. Folding it in (e.g. `info(.mcp, ["state": "started"])`) would
+produce a line with **no `msg=` field**, breaking `grep msg=`, log viewers, and the wire-format
+convention. So the dict is **always pure metadata**; the human-readable text is its own arg.
+
+The category is an **optional first argument** (defaulted), so the two "sugars" are really one family
+of overloads — category is just present or absent:
+
+```swift
+extension Logger {
+    // message + optional metadata (category omitted → default category)
+    func info(_ message: @autoclosure () -> Logger.Message,
+              _ metadata: [String: Any?] = [:],
+              file: String = #fileID, function: String = #function, line: UInt = #line)
+
+    // category + message + optional metadata
+    func info(_ category: some LogCategoryConvertible,
+              _ message: @autoclosure () -> Logger.Message,
+              _ metadata: [String: Any?] = [:],
+              file: String = #fileID, function: String = #function, line: UInt = #line)
+
+    // dynamic level (the closure-path entry) — same two shapes with `level:` up front
+    func custom(level: Logger.Level,
+                _ category: some LogCategoryConvertible,
+                _ message: @autoclosure () -> Logger.Message,
+                _ metadata: [String: Any?] = [:],
+                file: String = #fileID, function: String = #function, line: UInt = #line)
+}
+```
+`debug` / `warning` / `error` mirror `info` exactly. Call sites read:
+```swift
+log.info("wrote", ["bytes": n, "path": url])          // no category → default
+log.info(.mcp, "started", ["port": p])                // category + msg + metadata
+log.info(.mcp, "started")                             // category + msg, metadata defaulted
+log.custom(level: lvl, .mcp, "msg", ["k": v])         // dynamic level (closure path)
+```
+- **Why `(.mcp, "started", ["port": p])` and not `(.mcp, ["state": "started", "port": p])`:** the
+  message stays distinct (see above) so the line gets a real `msg="started"` and `port=…` is metadata.
+- `message` is `@autoclosure` (matches swift-log) so it isn't built when the level gate drops the call.
+- `metadata` defaults to `[:]` and is the trailing unlabeled arg — the ergonomic win over swift-log's
+  `metadata:` + `.stringConvertible` boilerplate.
+- All overloads render the `[String: Any?]` bag through the **same `String.logfmt` renderer** as the
+  closure path (one renderer → sugar and bridge can't drift), eagerly on the calling thread.
+- Additive on the real `Logger` — not a replacement type.
+
+**Routing existing closure-based loggers is a doc note, not a type:** an app's own closure body calls
+`log.custom(level:_:_:_:)` directly, mapping its runtime `level` and handing `context` as the metadata
+bag. The dynamic-level entry is the only affordance this requires.
+
+- **Tests:** every overload emits a distinct `msg=` field (message never collapses into metadata);
+  category-omitted vs category-present both work; sugar and the closure path produce identical bytes
+  for the same bag; `custom(level:)` routes a dynamic level correctly; an app `enum Cat: String`
+  conformed to `LogCategoryConvertible` works in `log.info(.mcp, …)` with no per-call
+  `.init(rawValue:)`; `@autoclosure` message is NOT evaluated when the level gate drops the call;
+  `file/function/line` forwarded.
 
 ### Phase 4 — Multi-destination
 **Goal:** fan one record out to many destinations with per-destination filtering, safe runtime
