@@ -1,7 +1,7 @@
 import Dispatch
 import Foundation
 
-public final class MemoryDestination: LogDestination, @unchecked Sendable {
+public final class MemoryDestination: LogDestination, FilterConfigObservable, @unchecked Sendable {
     public static let defaultCapacity = 5_000
 
     public let capacity: Int
@@ -94,6 +94,13 @@ public final class MemoryDestination: LogDestination, @unchecked Sendable {
         dirty = false
         lock.unlock()
         completion()
+    }
+
+    func setFilterConfigObserver(
+        _ observer: (@Sendable () -> Void)?,
+        for key: ObjectIdentifier
+    ) {
+        filter.setObserver(observer, for: key)
     }
 
     private func deliverChange() {

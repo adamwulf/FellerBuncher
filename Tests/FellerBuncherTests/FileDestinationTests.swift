@@ -202,6 +202,93 @@ func startupPruningUsesAgeAndCountButNeverDeletesActiveFile() throws {
 }
 
 @Test
+func sizeRotationWithSuffixNamesActiveFileAndSiblings() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "app",
+        suffix: "profile",
+        formatter: LogfmtFormatter(fields: [.message]),
+        rotationPolicy: .size(bytes: 35),
+        rotatedFilesToKeep: 2
+    )
+
+    destination.receive(record("11111111111111111111"))
+    destination.receive(record("22222222222222222222"))
+    destination.drain()
+
+    #expect(destination.fileURL.lastPathComponent == "app-profile.log")
+    let active = try String(contentsOf: destination.fileURL, encoding: .utf8)
+    let first = try String(
+        contentsOf: directory.appendingPathComponent("app-profile-1.log"),
+        encoding: .utf8
+    )
+    #expect(active == "msg=22222222222222222222\n")
+    #expect(first == "msg=11111111111111111111\n")
+    tearDown(destination)
+}
+
+@Test
+func countPruningOnlyRemovesNumberedSiblings() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileManager = FileManager.default
+    let names = ["app-1.log", "app-2.log", "app-snapshots.log", "app-2026-06-28.log"]
+    for name in names {
+        #expect(
+            fileManager.createFile(
+                atPath: directory.appendingPathComponent(name).path,
+                contents: Data(name.utf8)
+            )
+        )
+    }
+
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "app",
+        rotationPolicy: .none,
+        rotatedFilesToKeep: 1
+    )
+    destination.drain()
+
+    #expect(fileManager.fileExists(atPath: directory.appendingPathComponent("app-1.log").path))
+    #expect(!fileManager.fileExists(atPath: directory.appendingPathComponent("app-2.log").path))
+    #expect(
+        fileManager.fileExists(atPath: directory.appendingPathComponent("app-snapshots.log").path)
+    )
+    #expect(
+        fileManager.fileExists(atPath: directory.appendingPathComponent("app-2026-06-28.log").path)
+    )
+    tearDown(destination)
+}
+
+@Test
+func twoWritersSharingAFileNeverOverwriteEachOther() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writers = try (0..<2).map { _ in
+        try FileDestination(
+            logDirectory: directory,
+            processName: "shared",
+            formatter: LogfmtFormatter(fields: [.message]),
+            rotationPolicy: .none
+        )
+    }
+
+    // Each writer opened the file at offset 0. Without O_APPEND the second
+    // writer's first line would land on top of the first writer's.
+    for (index, writer) in [writers[0], writers[1], writers[0], writers[1]].enumerated() {
+        writer.receive(record("line-\(index)"))
+        writer.drain()
+    }
+
+    let contents = try String(contentsOf: writers[0].fileURL, encoding: .utf8)
+    #expect(contents == "msg=line-0\nmsg=line-1\nmsg=line-2\nmsg=line-3\n")
+    writers.forEach(tearDown)
+}
+
+@Test
 func bootstrapIsIdempotentAndFirstLogLands() throws {
     let firstDirectory = try makeTemporaryDirectory()
     let secondDirectory = try makeTemporaryDirectory()

@@ -94,9 +94,10 @@ public func bootstrap(
     case (.none, .none):
         destinations = [fileDestination]
     }
-    let registry = DestinationRegistry(
+    let registry = makeLiveRegistry(
         destinations: destinations,
-        globalLevel: minimumLevel
+        globalLevel: minimumLevel,
+        preConfigCoordinator: bootstrapState.preConfigCoordinator
     )
 
     let handle = LoggingHandle(
@@ -105,12 +106,7 @@ public func bootstrap(
         registry: registry
     )
 
-    if let coordinator = bootstrapState.preConfigCoordinator {
-        // Pre-config capture already owns the single LoggingSystem.bootstrap.
-        // Switch it live and replay the buffered prefix tagged late=true; all
-        // loggers (pre- and post-bootstrap) route through it to this registry.
-        coordinator.activate(registry: registry)
-    } else {
+    if bootstrapState.preConfigCoordinator == nil {
         LoggingSystem.bootstrap(
             { label, metadataProvider in
                 FellerBuncherLogHandler(
@@ -125,4 +121,24 @@ public func bootstrap(
     }
     bootstrapState.handle = handle
     return handle
+}
+
+/// Builds the registry `bootstrap` installs. With pre-config capture
+/// installed, the registry is built on the coordinator's gate (every logger
+/// keeps the pre-config handler after bootstrap, so this registry must keep
+/// that handler's gate current) and the coordinator is switched live,
+/// replaying the buffered prefix tagged `late=true`. Pre-config capture
+/// already owns the single `LoggingSystem.bootstrap` in that case.
+func makeLiveRegistry(
+    destinations: [any LogDestination],
+    globalLevel: Logger.Level,
+    preConfigCoordinator: PreConfigCoordinator?
+) -> DestinationRegistry {
+    let registry = DestinationRegistry(
+        destinations: destinations,
+        globalLevel: globalLevel,
+        gate: preConfigCoordinator?.gate ?? LevelGate()
+    )
+    preConfigCoordinator?.activate(registry: registry)
+    return registry
 }

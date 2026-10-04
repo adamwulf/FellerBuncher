@@ -4,6 +4,22 @@ import Logging
 enum FellerBuncherBridge {
     static let categoryKey = "__fellerbuncher_category"
     static let metadataFragmentKey = "__fellerbuncher_metadata"
+
+    /// The category a swift-log event carries through the bridge metadata, or
+    /// `.default` when it carries none.
+    static func category(of event: LogEvent) -> LogCategory {
+        guard let value = event.metadata?[categoryKey] else {
+            return .default
+        }
+        switch value {
+        case .string(let rawValue):
+            return LogCategory(rawValue: rawValue)
+        case .stringConvertible(let rawValue):
+            return LogCategory(rawValue: rawValue.description)
+        case .dictionary, .array:
+            return .default
+        }
+    }
 }
 
 public struct FellerBuncherLogHandler: LogHandler {
@@ -11,12 +27,10 @@ public struct FellerBuncherLogHandler: LogHandler {
     public var metadata: Logger.Metadata
     public var logLevel: Logger.Level {
         get {
-            if registry.hasForceIncludedCategories() {
-                return .trace
-            }
-            // The global level is the shipping toggle ("Enable Debug Logging");
-            // a per-logger override only ever loosens the gate further.
-            return min(registry.globalLevel(), configuredLogLevel)
+            // The lowest level any destination accepts for any category;
+            // `log(event:)` then applies the per-category floor. A per-logger
+            // override only ever loosens the gate further.
+            min(registry.gate.lowestLevel() ?? .critical, configuredLogLevel)
         }
         set {
             configuredLogLevel = newValue
@@ -59,16 +73,14 @@ public struct FellerBuncherLogHandler: LogHandler {
         set { metadata[key] = newValue }
     }
 
+    /// `true` when a destination accepts `level` for `category`, or the
+    /// per-logger override admits `level`. One lock, no destination snapshot.
+    func accepts(_ level: Logger.Level, category: LogCategory) -> Bool {
+        level >= configuredLogLevel || registry.gate.accepts(level, category: category)
+    }
+
     public func log(event: LogEvent) {
-        let bridgedCategory: LogCategory = (
-            event.metadata?[FellerBuncherBridge.categoryKey]
-        )
-            .flatMap(Self.stringValue)
-            .map { LogCategory(rawValue: $0) } ?? LogCategory.default
-        let effectiveLevel = min(registry.globalLevel(), configuredLogLevel)
-        guard event.level >= effectiveLevel
-            || registry.forceIncludes(bridgedCategory)
-        else {
+        guard accepts(event.level, category: FellerBuncherBridge.category(of: event)) else {
             return
         }
 

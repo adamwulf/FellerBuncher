@@ -539,6 +539,39 @@ func dateStampedFileURLReflectsActiveFileAfterRoll() throws {
 }
 
 @Test
+func dateStampedSuffixFollowsTheDateAndSurvivesTheRoll() throws {
+    let directory = try makeControlTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let day1 = Date(timeIntervalSince1970: 1_782_621_952) // 2026-06-28 UTC
+    let day2 = day1.addingTimeInterval(24 * 60 * 60)       // 2026-06-29 UTC
+    let clock = MutableClock(day1)
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "Muse-App",
+        suffix: "snapshots",
+        rotationPolicy: .dateStamped(),
+        filterConfig: FilterConfig(minimumLevel: .trace),
+        now: clock.now
+    )
+    defer { tearDownFile(destination) }
+
+    #expect(destination.fileURL.lastPathComponent == "Muse-App-2026-06-28-snapshots.log")
+    destination.receive(phase5Record("day1"))
+    drainFile(destination)
+
+    clock.advance(to: day2)
+    destination.receive(phase5Record("day2"))
+    drainFile(destination)
+
+    #expect(destination.fileURL.lastPathComponent == "Muse-App-2026-06-29-snapshots.log")
+    let day1File = directory.appendingPathComponent("Muse-App-2026-06-28-snapshots.log")
+    let day2File = directory.appendingPathComponent("Muse-App-2026-06-29-snapshots.log")
+    #expect(try String(contentsOf: day1File, encoding: .utf8).contains("msg=day1"))
+    #expect(try String(contentsOf: day2File, encoding: .utf8).contains("msg=day2"))
+}
+
+@Test
 func coldLaunchAfterDayBoundaryOpensNewDatedFile() throws {
     let directory = try makeControlTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }

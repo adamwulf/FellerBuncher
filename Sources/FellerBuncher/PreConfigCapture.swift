@@ -25,6 +25,12 @@ final class PreConfigCoordinator: @unchecked Sendable {
     private var buffer: [LogRecord] = []
     private var registry: DestinationRegistry?
 
+    /// The gate every `PreConfigLogHandler` checks. It accepts everything while
+    /// buffering; `bootstrap` hands it to the live registry, which rebuilds it
+    /// from the real destinations. Immutable, so the per-call check takes only
+    /// the gate's own lock.
+    let gate = LevelGate()
+
     init(capacity: Int = PreConfigCoordinator.defaultCapacity) {
         self.capacity = max(1, capacity)
         buffer.reserveCapacity(self.capacity)
@@ -47,29 +53,20 @@ final class PreConfigCoordinator: @unchecked Sendable {
     }
 
     /// The effective gate for the pre-config handler: `.trace` while buffering
-    /// (capture everything), the live global level once activated. Keeps the
-    /// cheap handler-level gate alive for loggers created after bootstrap.
+    /// (capture everything), the lowest level any live destination accepts
+    /// once bootstrap has linked the gate. Keeps the cheap handler-level gate
+    /// alive for loggers created after bootstrap.
     func effectiveLevel() -> Logger.Level {
-        lock.lock()
-        let registry = self.registry
-        lock.unlock()
-        guard let registry else {
-            return .trace
-        }
-        return registry.hasForceIncludedCategories()
-            ? .trace
-            : registry.globalLevel()
-    }
-
-    func forceIncludes(_ category: LogCategory) -> Bool {
-        lock.lock()
-        let registry = self.registry
-        lock.unlock()
-        return registry?.forceIncludes(category) ?? false
+        gate.lowestLevel() ?? .critical
     }
 
     /// Switches to live mode and replays the buffered prefix into `registry`,
     /// each record tagged `late=true`. Idempotent: a second activation no-ops.
+    ///
+    /// The handlers' gate follows `registry` only when `registry` was built
+    /// on this coordinator's `gate`, as `bootstrap` does. With any other
+    /// registry the gate keeps accepting everything and the destinations'
+    /// own filters do all the dropping.
     func activate(registry: DestinationRegistry) {
         lock.lock()
         guard self.registry == nil else {
@@ -106,11 +103,11 @@ public struct PreConfigLogHandler: LogHandler {
     public var metadata: Logger.Metadata = [:]
     public var logLevel: Logger.Level {
         get { coordinator.effectiveLevel() }
-        // The global level is authoritative here. Unlike the live
+        // The shared per-category gate is authoritative here. Unlike the live
         // FellerBuncherLogHandler (which loosens its gate with a per-logger
-        // override via min(global, configured)), the pre-config path
-        // intentionally ignores per-logger overrides — it is the transitional
-        // bootstrap handler, gated only by the global level.
+        // override via min(lowest floor, configured)), this handler ignores
+        // per-logger overrides. With installPreConfigCapture it stays the
+        // handler of every logger for the life of the process.
         set {}
     }
 
@@ -132,18 +129,16 @@ public struct PreConfigLogHandler: LogHandler {
         set { metadata[key] = newValue }
     }
 
+    /// While buffering the gate accepts everything (capture all). Once
+    /// bootstrap links it, it holds the live per-category floors, so
+    /// post-bootstrap loggers routed through this handler get the same
+    /// one-lock check as the live handler.
+    func accepts(_ level: Logger.Level, category: LogCategory) -> Bool {
+        coordinator.gate.accepts(level, category: category)
+    }
+
     public func log(event: LogEvent) {
-        // While buffering, the gate is `.trace` (capture everything). Once
-        // activated it tracks the live global level, so post-bootstrap loggers
-        // routed through this handler still get the cheap level gate.
-        let bridgedCategory: LogCategory = (
-            event.metadata?[FellerBuncherBridge.categoryKey]
-        )
-            .flatMap(Self.stringValue)
-            .map { LogCategory(rawValue: $0) } ?? LogCategory.default
-        guard event.level >= coordinator.effectiveLevel()
-            || coordinator.forceIncludes(bridgedCategory)
-        else {
+        guard accepts(event.level, category: FellerBuncherBridge.category(of: event)) else {
             return
         }
 
@@ -154,16 +149,5 @@ public struct PreConfigLogHandler: LogHandler {
             metadataProvider: metadataProvider
         )
         coordinator.ingest(record)
-    }
-
-    private static func stringValue(_ value: Logger.Metadata.Value) -> String? {
-        switch value {
-        case .string(let value):
-            value
-        case .stringConvertible(let value):
-            value.description
-        case .dictionary, .array:
-            nil
-        }
     }
 }

@@ -188,6 +188,56 @@ let logging = try bootstrap(
 - **`inMemory: true`** exposes `logging.memoryDestination` with a `snapshot()`
   of recent records (for an in-app log viewer) and an `onChange` hook.
 
+### Extra files with a fixed level
+
+A destination follows the global level by default: the global level is its
+level, and a `minimumLevel` set below it admits nothing extra. Give its
+`FilterConfig` `followsGlobalLevel: false` to keep its own level, and give a
+`FileDestination` a `suffix` to write a second file next to the main one:
+
+```swift
+// MyApp-2026-10-03-snapshots.log: three categories at .trace, whatever the
+// global level is.
+let snapshots = try FileDestination(
+    logDirectory: logDir,
+    processName: "MyApp",
+    suffix: "snapshots",
+    rotationPolicy: .dateStamped(),
+    retention: retention,                    // the same value bootstrap got
+    filterConfig: FilterConfig(
+        minimumLevel: .trace,
+        include: ["render", "graph", "snapshot"],
+        followsGlobalLevel: false
+    )
+)
+logging.addDestination(snapshots)
+// …later…
+logging.removeDestination(snapshots)
+```
+
+`removeDestination` drains and closes the destination for good: adding the same
+instance again logs nothing. To write the file again, create a new
+`FileDestination`; it appends to the same day's file.
+
+Every file destination prunes **all** old `.log` files in its directory (except
+its own active file), so give each destination in one directory the same
+`retention` and `pruneDate` as the main file; a shorter retention on the extra
+file would delete main logs early.
+
+`setGlobalLevel` and `addDestination` leave such a destination's level alone.
+The FellerBuncher overloads (`debug`/`info`/`warning`/`error`/`custom` with a
+category or a metadata bag) drop a call before they render its message and
+metadata unless some destination accepts its level and category, so the
+`.trace` file does not make `.trace` calls in other categories expensive. (With
+`bootstrap`'s own handler, that is without pre-config capture, a call at or
+above bootstrap's `minimumLevel` always passes this check.) Plain swift-log
+calls are gated only by `logLevel`, the lowest level any destination accepts:
+while a `.trace` file is registered they build their message and metadata
+before the handler drops them.
+
+Files are opened with `O_APPEND`, so two writers that share a file name never
+overwrite each other's lines.
+
 ### Pre-config capture (don't lose early logs)
 
 If code may log before `bootstrap` runs, install the capture buffer at the very
@@ -213,7 +263,10 @@ the `Logger` convenience sugar.
 **Leaves to your app:** the log directory, share/save UI, a log-viewer screen,
 zip/export, and any custom destinations (e.g. a Sentry destination). Custom
 destinations are first-class — conform to `LogDestination` and
-`logging.addDestination(_:)` at runtime.
+`logging.addDestination(_:)` at runtime. If a custom destination changes its
+own filter config after it is added, call
+`logging.registry.filterConfigDidChange()` so the level gate sees the change
+(the built-in destinations do this for you).
 
 ## License
 
