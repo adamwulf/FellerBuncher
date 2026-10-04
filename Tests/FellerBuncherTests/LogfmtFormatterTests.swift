@@ -153,6 +153,12 @@ func customTimestampIsExactly23Characters() {
     #expect(timestamp.count == 23)
 }
 
+@Test
+func utcZoneEqualsGMT() {
+    #expect(TimeZone.fellerBuncherUTC == .gmt)
+    #expect(RotationPolicy.dateStamped() == .dateStamped(zone: .gmt))
+}
+
 @Test(
     arguments: [
         0.000,

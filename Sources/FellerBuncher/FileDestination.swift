@@ -13,7 +13,7 @@ public enum RotationPolicy: Sendable, Equatable {
     /// The active filename embeds the date (`<name>-yyyy-MM-dd.log` for `.day`)
     /// in `zone` (default UTC). Rolls at the boundary by computed-filename-differs
     /// — no timer, no numbered siblings; pruning is purely age-based.
-    case dateStamped(granularity: DateGranularity = .day, zone: TimeZone = .gmt)
+    case dateStamped(granularity: DateGranularity = .day, zone: TimeZone = .fellerBuncherUTC)
 }
 
 public enum PruneDate: Sendable, Equatable {
