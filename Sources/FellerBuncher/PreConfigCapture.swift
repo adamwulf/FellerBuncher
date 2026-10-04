@@ -103,11 +103,11 @@ public struct PreConfigLogHandler: LogHandler, CategoryGatingLogHandler {
     public var metadata: Logger.Metadata = [:]
     public var logLevel: Logger.Level {
         get { coordinator.effectiveLevel() }
-        // The global level is authoritative here. Unlike the live
+        // The shared per-category gate is authoritative here. Unlike the live
         // FellerBuncherLogHandler (which loosens its gate with a per-logger
-        // override via min(global, configured)), the pre-config path
-        // intentionally ignores per-logger overrides — it is the transitional
-        // bootstrap handler, gated only by the global level.
+        // override via min(lowest floor, configured)), this handler ignores
+        // per-logger overrides. With installPreConfigCapture it stays the
+        // handler of every logger for the life of the process.
         set {}
     }
 

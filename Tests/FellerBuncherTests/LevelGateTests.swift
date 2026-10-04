@@ -231,8 +231,10 @@ func handlerLogLevelIsTheLowestFloorAcrossCategories() {
     #expect(logger.logLevel == .trace)
 }
 
+/// The Muse path: installPreConfigCapture, then bootstrap. Every logger keeps
+/// the pre-config handler, so bootstrap's registry must rebuild its gate.
 @Test
-func preConfigHandlerGateAcceptsEverythingThenFollowsTheLinkedRegistry() {
+func preConfigHandlerGateAcceptsEverythingThenFollowsTheBootstrapRegistry() {
     let coordinator = PreConfigCoordinator(capacity: 10)
     let logger = Logger(label: "pre-config-gate") { label in
         PreConfigLogHandler(label: label, coordinator: coordinator)
@@ -246,12 +248,11 @@ func preConfigHandlerGateAcceptsEverythingThenFollowsTheLinkedRegistry() {
 
     let main = MemoryDestination(capacity: 10, filterConfig: FilterConfig(minimumLevel: .info))
     let snapshots = MemoryDestination(capacity: 10, filterConfig: fixedTraceConfig([render]))
-    let registry = DestinationRegistry(
+    _ = makeLiveRegistry(
         destinations: [main, snapshots],
         globalLevel: .info,
-        gate: coordinator.gate
+        preConfigCoordinator: coordinator
     )
-    coordinator.activate(registry: registry)
 
     #expect(logger.logLevel == .trace)
     logger.custom(level: .trace, sync, metadata: ["probe": probe])

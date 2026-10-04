@@ -13,7 +13,9 @@ public enum RotationPolicy: Sendable, Equatable {
     /// The active filename embeds the date (`<name>-yyyy-MM-dd.log` for `.day`,
     /// or `<name>-yyyy-MM-dd-<suffix>.log` with a suffix) in `zone` (default
     /// UTC). Rolls at the boundary by computed-filename-differs — no timer, no
-    /// numbered siblings; pruning is purely age-based.
+    /// numbered siblings; pruning is purely age-based. The active day's
+    /// boundaries are computed once per day, so a change of an
+    /// `.autoupdatingCurrent` zone takes effect at the next day boundary.
     case dateStamped(granularity: DateGranularity = .day, zone: TimeZone = .fellerBuncherUTC)
 }
 
@@ -83,7 +85,10 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
     ///   keep several files side by side. A `.dateStamped` file is named
     ///   `<processName>-yyyy-MM-dd-<suffix>.log` (the suffix stays after the
     ///   date across rolls, so one day's files sort together); any other
-    ///   policy writes `<processName>-<suffix>.log`.
+    ///   policy writes `<processName>-<suffix>.log`. Age pruning sweeps every
+    ///   `.log` file in `logDirectory` except this destination's own active
+    ///   file, so give every destination in one directory the same
+    ///   `retention` and `pruneDate`.
     public init(
         logDirectory: URL,
         processName: String,
@@ -521,10 +526,14 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         case .day:
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = zone
+            // `dateInterval(of:for:)`, not startOfDay + 1 day: where DST starts
+            // at midnight the day starts at 01:00, and adding a day to that
+            // would end the period an hour into the next day.
+            if let interval = calendar.dateInterval(of: .day, for: date) {
+                return interval.start..<interval.end
+            }
             let start = calendar.startOfDay(for: date)
-            let end = calendar.date(byAdding: .day, value: 1, to: start)
-                ?? start.addingTimeInterval(24 * 60 * 60)
-            return start..<end
+            return start..<start.addingTimeInterval(24 * 60 * 60)
         }
     }
 

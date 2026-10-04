@@ -7,9 +7,12 @@ public struct FilterConfig: Sendable, Equatable {
     public var exclude: Set<LogCategory>
     public var forceInclude: Set<LogCategory>
     /// When `true` (the default), `setGlobalLevel` and `addDestination`
-    /// overwrite `minimumLevel` with the global level. When `false`, the
-    /// destination keeps its own `minimumLevel`: for example, a specialty file
-    /// that takes a few categories at `.trace` while the global level is `.info`.
+    /// overwrite `minimumLevel` with the global level, and the level gate
+    /// treats the global level as this destination's level: a `minimumLevel`
+    /// set directly below the global level admits nothing extra. When
+    /// `false`, the destination keeps its own `minimumLevel`: for example, a
+    /// specialty file that takes a few categories at `.trace` while the global
+    /// level is `.info`.
     public var followsGlobalLevel: Bool
 
     public init(

@@ -190,9 +190,10 @@ let logging = try bootstrap(
 
 ### Extra files with a fixed level
 
-A destination follows the global level by default. Give its `FilterConfig`
-`followsGlobalLevel: false` to keep its own level, and give a `FileDestination`
-a `suffix` to write a second file next to the main one:
+A destination follows the global level by default: the global level is its
+level, and a `minimumLevel` set below it admits nothing extra. Give its
+`FilterConfig` `followsGlobalLevel: false` to keep its own level, and give a
+`FileDestination` a `suffix` to write a second file next to the main one:
 
 ```swift
 // MyApp-2026-10-03-snapshots.log: three categories at .trace, whatever the
@@ -202,6 +203,7 @@ let snapshots = try FileDestination(
     processName: "MyApp",
     suffix: "snapshots",
     rotationPolicy: .dateStamped(),
+    retention: retention,                    // the same value bootstrap got
     filterConfig: FilterConfig(
         minimumLevel: .trace,
         include: ["render", "graph", "snapshot"],
@@ -210,6 +212,11 @@ let snapshots = try FileDestination(
 )
 logging.addDestination(snapshots)
 ```
+
+Every file destination prunes **all** old `.log` files in its directory (except
+its own active file), so give each destination in one directory the same
+`retention` and `pruneDate` as the main file; a shorter retention on the extra
+file would delete main logs early.
 
 `setGlobalLevel` and `addDestination` leave such a destination's level alone.
 A call is dropped before its message and metadata are rendered unless some

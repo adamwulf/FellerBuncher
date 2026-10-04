@@ -114,14 +114,17 @@ func sanitizeKeepsCleanStringsAndStripsEveryControlCharacter() {
 
 // MARK: - Date-roll boundary
 
-@Test(arguments: ["UTC", "America/Chicago", "Asia/Kolkata"])
+@Test(arguments: ["UTC", "America/Chicago", "Asia/Kolkata", "America/Santiago"])
 func datePeriodSpansExactlyTheDatesWithTheSameStamp(zoneIdentifier: String) throws {
     let zone = try #require(TimeZone(identifier: zoneIdentifier))
-    // Includes the 2026 US DST changes (23- and 25-hour days in Chicago).
+    // Includes the 2026 US DST changes (23- and 25-hour days in Chicago) and
+    // Santiago's 2026-09-06, where DST starts at midnight (the day starts at
+    // 01:00).
     let samples = [
         Date(timeIntervalSince1970: 1_791_080_000.123),
         Date(timeIntervalSince1970: 1_773_014_400),
         Date(timeIntervalSince1970: 1_793_516_400),
+        Date(timeIntervalSince1970: 1_788_710_400),
     ]
     for date in samples {
         let period = FileDestination.datePeriod(containing: date, granularity: .day, zone: zone)

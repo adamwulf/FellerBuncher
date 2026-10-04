@@ -45,7 +45,9 @@ public final class LoggingHandle: @unchecked Sendable {
 
     // MARK: Runtime registry mutation
 
-    /// Adds a destination at runtime. It inherits the current global level.
+    /// Adds a destination at runtime. A destination that follows the global
+    /// level inherits it; a fixed-level destination keeps its own
+    /// `minimumLevel`.
     public func addDestination(_ destination: any LogDestination) {
         registry.addDestination(destination)
     }
@@ -61,9 +63,10 @@ public final class LoggingHandle: @unchecked Sendable {
 
     // MARK: Global level control
 
-    /// Writes `level` into the handler gate **and** every destination's
-    /// `FilterConfig`, so the level reaches the destinations, not just the
-    /// handler. Backs a shipping "Enable Debug Logging" toggle. Fires
+    /// Writes `level` into the handler gate **and** the `FilterConfig` of every
+    /// destination that follows the global level, so the level reaches the
+    /// destinations, not just the handler. Fixed-level destinations keep their
+    /// own level. Backs a shipping "Enable Debug Logging" toggle. Fires
     /// `onEffectiveLevelChange` on the calling thread.
     public func setGlobalLevel(_ level: Logger.Level) {
         registry.setGlobalLevel(level)
