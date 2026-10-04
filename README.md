@@ -188,6 +188,35 @@ let logging = try bootstrap(
 - **`inMemory: true`** exposes `logging.memoryDestination` with a `snapshot()`
   of recent records (for an in-app log viewer) and an `onChange` hook.
 
+### Extra files with a fixed level
+
+A destination follows the global level by default. Give its `FilterConfig`
+`followsGlobalLevel: false` to keep its own level, and give a `FileDestination`
+a `suffix` to write a second file next to the main one:
+
+```swift
+// MyApp-2026-10-03-snapshots.log: three categories at .trace, whatever the
+// global level is.
+let snapshots = try FileDestination(
+    logDirectory: logDir,
+    processName: "MyApp",
+    suffix: "snapshots",
+    rotationPolicy: .dateStamped(),
+    filterConfig: FilterConfig(
+        minimumLevel: .trace,
+        include: ["render", "graph", "snapshot"],
+        followsGlobalLevel: false
+    )
+)
+logging.addDestination(snapshots)
+```
+
+`setGlobalLevel` and `addDestination` leave such a destination's level alone.
+A call is dropped before its message and metadata are rendered unless some
+destination accepts its level and category, so the `.trace` file does not make
+`.trace` calls in other categories expensive. Files are opened with `O_APPEND`,
+so two writers that share a file name never overwrite each other's lines.
+
 ### Pre-config capture (don't lose early logs)
 
 If code may log before `bootstrap` runs, install the capture buffer at the very
@@ -213,7 +242,10 @@ the `Logger` convenience sugar.
 **Leaves to your app:** the log directory, share/save UI, a log-viewer screen,
 zip/export, and any custom destinations (e.g. a Sentry destination). Custom
 destinations are first-class — conform to `LogDestination` and
-`logging.addDestination(_:)` at runtime.
+`logging.addDestination(_:)` at runtime. If a custom destination changes its
+own filter config after it is added, call
+`logging.registry.filterConfigDidChange()` so the level gate sees the change
+(the built-in destinations do this for you).
 
 ## License
 
