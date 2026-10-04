@@ -211,7 +211,13 @@ let snapshots = try FileDestination(
     )
 )
 logging.addDestination(snapshots)
+// …later…
+logging.removeDestination(snapshots)
 ```
+
+`removeDestination` drains and closes the destination for good: adding the same
+instance again logs nothing. To write the file again, create a new
+`FileDestination`; it appends to the same day's file.
 
 Every file destination prunes **all** old `.log` files in its directory (except
 its own active file), so give each destination in one directory the same
@@ -219,10 +225,18 @@ its own active file), so give each destination in one directory the same
 file would delete main logs early.
 
 `setGlobalLevel` and `addDestination` leave such a destination's level alone.
-A call is dropped before its message and metadata are rendered unless some
-destination accepts its level and category, so the `.trace` file does not make
-`.trace` calls in other categories expensive. Files are opened with `O_APPEND`,
-so two writers that share a file name never overwrite each other's lines.
+The FellerBuncher overloads (`debug`/`info`/`warning`/`error`/`custom` with a
+category or a metadata bag) drop a call before they render its message and
+metadata unless some destination accepts its level and category, so the
+`.trace` file does not make `.trace` calls in other categories expensive. (With
+`bootstrap`'s own handler, that is without pre-config capture, a call at or
+above bootstrap's `minimumLevel` always passes this check.) Plain swift-log
+calls are gated only by `logLevel`, the lowest level any destination accepts:
+while a `.trace` file is registered they build their message and metadata
+before the handler drops them.
+
+Files are opened with `O_APPEND`, so two writers that share a file name never
+overwrite each other's lines.
 
 ### Pre-config capture (don't lose early logs)
 

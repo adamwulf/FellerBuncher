@@ -212,9 +212,10 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
     }
 
     /// An idempotent date-roll the app may poke on any cadence (no package
-    /// timer). A no-op unless the computed filename for `now` differs from the
-    /// currently-open file. Runs on the serial queue, so it is ordered against
-    /// writes and pruning.
+    /// timer). A no-op while `now` is inside the active file's day; a zone
+    /// change takes effect at the next day boundary (see
+    /// `RotationPolicy.dateStamped`). Runs on the serial queue, so it is
+    /// ordered against writes and pruning.
     public func rollIfDateChanged() {
         queue.async { [self] in
             guard !closed else {

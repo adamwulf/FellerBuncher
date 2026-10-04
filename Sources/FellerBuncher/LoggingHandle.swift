@@ -53,7 +53,8 @@ public final class LoggingHandle: @unchecked Sendable {
     }
 
     /// Removes a destination at runtime, draining and tearing it down before
-    /// `completion` fires.
+    /// `completion` fires. A torn-down built-in destination stays closed:
+    /// adding the same instance again logs nothing, so create a new one.
     public func removeDestination(
         _ destination: any LogDestination,
         completion: @escaping @Sendable () -> Void = {}
