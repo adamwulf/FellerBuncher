@@ -202,6 +202,68 @@ func startupPruningUsesAgeAndCountButNeverDeletesActiveFile() throws {
 }
 
 @Test
+func sizeRotationWithSuffixNamesActiveFileAndSiblings() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "app",
+        suffix: "profile",
+        formatter: LogfmtFormatter(fields: [.message]),
+        rotationPolicy: .size(bytes: 35),
+        rotatedFilesToKeep: 2
+    )
+
+    destination.receive(record("11111111111111111111"))
+    destination.receive(record("22222222222222222222"))
+    destination.drain()
+
+    #expect(destination.fileURL.lastPathComponent == "app-profile.log")
+    let active = try String(contentsOf: destination.fileURL, encoding: .utf8)
+    let first = try String(
+        contentsOf: directory.appendingPathComponent("app-profile-1.log"),
+        encoding: .utf8
+    )
+    #expect(active == "msg=22222222222222222222\n")
+    #expect(first == "msg=11111111111111111111\n")
+    tearDown(destination)
+}
+
+@Test
+func countPruningOnlyRemovesNumberedSiblings() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileManager = FileManager.default
+    let names = ["app-1.log", "app-2.log", "app-snapshots.log", "app-2026-06-28.log"]
+    for name in names {
+        #expect(
+            fileManager.createFile(
+                atPath: directory.appendingPathComponent(name).path,
+                contents: Data(name.utf8)
+            )
+        )
+    }
+
+    let destination = try FileDestination(
+        logDirectory: directory,
+        processName: "app",
+        rotationPolicy: .none,
+        rotatedFilesToKeep: 1
+    )
+    destination.drain()
+
+    #expect(fileManager.fileExists(atPath: directory.appendingPathComponent("app-1.log").path))
+    #expect(!fileManager.fileExists(atPath: directory.appendingPathComponent("app-2.log").path))
+    #expect(
+        fileManager.fileExists(atPath: directory.appendingPathComponent("app-snapshots.log").path)
+    )
+    #expect(
+        fileManager.fileExists(atPath: directory.appendingPathComponent("app-2026-06-28.log").path)
+    )
+    tearDown(destination)
+}
+
+@Test
 func bootstrapIsIdempotentAndFirstLogLands() throws {
     let firstDirectory = try makeTemporaryDirectory()
     let secondDirectory = try makeTemporaryDirectory()
