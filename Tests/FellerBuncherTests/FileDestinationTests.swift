@@ -264,6 +264,31 @@ func countPruningOnlyRemovesNumberedSiblings() throws {
 }
 
 @Test
+func twoWritersSharingAFileNeverOverwriteEachOther() throws {
+    let directory = try makeTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writers = try (0..<2).map { _ in
+        try FileDestination(
+            logDirectory: directory,
+            processName: "shared",
+            formatter: LogfmtFormatter(fields: [.message]),
+            rotationPolicy: .none
+        )
+    }
+
+    // Each writer opened the file at offset 0. Without O_APPEND the second
+    // writer's first line would land on top of the first writer's.
+    for (index, writer) in [writers[0], writers[1], writers[0], writers[1]].enumerated() {
+        writer.receive(record("line-\(index)"))
+        writer.drain()
+    }
+
+    let contents = try String(contentsOf: writers[0].fileURL, encoding: .utf8)
+    #expect(contents == "msg=line-0\nmsg=line-1\nmsg=line-2\nmsg=line-3\n")
+    writers.forEach(tearDown)
+}
+
+@Test
 func bootstrapIsIdempotentAndFirstLogLands() throws {
     let firstDirectory = try makeTemporaryDirectory()
     let secondDirectory = try makeTemporaryDirectory()

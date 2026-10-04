@@ -134,18 +134,12 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         }
         self.activeFileURL = initialURL
 
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(
+        try FileManager.default.createDirectory(
             at: logDirectory,
             withIntermediateDirectories: true
         )
-        if !fileManager.fileExists(atPath: initialURL.path) {
-            guard fileManager.createFile(atPath: initialURL.path, contents: nil) else {
-                throw CocoaError(.fileWriteUnknown)
-            }
-        }
 
-        let handle = try FileHandle(forWritingTo: initialURL)
+        let handle = try Self.openForAppending(initialURL)
         self.currentSize = try handle.seekToEnd()
         self.fileHandle = handle
 
@@ -278,17 +272,8 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         try? fileHandle?.close()
         fileHandle = nil
 
-        let fileManager = FileManager.default
-        if !fileManager.fileExists(atPath: target.path) {
-            guard fileManager.createFile(atPath: target.path, contents: nil) else {
-                degradationLogger.error(
-                    "date roll create failed path=\(target.path, privacy: .public)"
-                )
-                return
-            }
-        }
         do {
-            let handle = try FileHandle(forWritingTo: target)
+            let handle = try Self.openForAppending(target)
             currentSize = try handle.seekToEnd()
             fileHandle = handle
             activeFileURL = target
@@ -320,11 +305,9 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
             fileHandle = nil
             try shiftRotatedFiles()
             try moveItem(at: activeFileURL, to: rotatedFileURL(index: 1))
-            guard FileManager.default.createFile(atPath: activeFileURL.path, contents: nil) else {
-                throw CocoaError(.fileWriteUnknown)
-            }
-            fileHandle = try FileHandle(forWritingTo: activeFileURL)
-            currentSize = 0
+            let handle = try Self.openForAppending(activeFileURL)
+            currentSize = try handle.seekToEnd()
+            fileHandle = handle
         } catch {
             degradationLogger.error(
                 "rotation move failed path=\(self.activeFileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
@@ -357,7 +340,7 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
     private func reopenAndTruncateActiveFile() {
         do {
             if fileHandle == nil {
-                fileHandle = try FileHandle(forWritingTo: activeFileURL)
+                fileHandle = try Self.openForAppending(activeFileURL)
             }
             try fileHandle?.truncate(atOffset: 0)
             try fileHandle?.seek(toOffset: 0)
@@ -463,6 +446,24 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
 
     private func rotatedFileURL(index: Int) -> URL {
         logDirectory.appendingPathComponent("\(fileStem)-\(index).log")
+    }
+
+    /// Opens `url` for writing, creating it if needed, with `O_APPEND`: every
+    /// write lands at the current end of the file, so two writers that share a
+    /// file name (an app and its extension, two destinations) never overwrite
+    /// each other's lines.
+    static func openForAppending(_ url: URL) throws -> FileHandle {
+        let result: (descriptor: Int32, error: Int32) = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else {
+                return (-1, EINVAL)
+            }
+            let descriptor = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o644)
+            return (descriptor, descriptor < 0 ? errno : 0)
+        }
+        guard result.descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: result.error) ?? .EIO)
+        }
+        return FileHandle(fileDescriptor: result.descriptor, closeOnDealloc: true)
     }
 
     /// The last path component of `value`, or `nil` when there is none.
