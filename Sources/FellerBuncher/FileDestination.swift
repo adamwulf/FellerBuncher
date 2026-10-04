@@ -54,6 +54,9 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
     // Every mutable property below is confined to `queue`.
     private var fileHandle: FileHandle?
     private var activeFileURL: URL
+    /// For `.dateStamped`, the span of dates whose stamp names the active
+    /// file. A write inside it skips the stamp formatting and URL work.
+    private var activePeriod: Range<Date>?
     private var currentSize: UInt64
     private var lastPruneDate: Date?
     private var closed = false
@@ -122,12 +125,19 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         switch rotationPolicy {
         case .none, .size:
             initialURL = baseURL
+            self.activePeriod = nil
         case .dateStamped(let granularity, let zone):
+            let launchDate = now()
             initialURL = Self.datedFileURL(
                 logDirectory: logDirectory,
                 processName: safeProcessName,
                 suffix: safeSuffix,
-                date: now(),
+                date: launchDate,
+                granularity: granularity,
+                zone: zone
+            )
+            self.activePeriod = Self.datePeriod(
+                containing: launchDate,
                 granularity: granularity,
                 zone: zone
             )
@@ -176,13 +186,13 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
             guard !closed else {
                 return
             }
+            let date = now()
             // Date rotation is by computed-filename-differs, checked cheaply on
             // every write so the first write after midnight opens the new file.
-            rollIfDateChangedLocked(now: now())
-            let line = formatter.format(record) + "\n"
-            guard let data = line.data(using: .utf8) else {
-                return
-            }
+            rollIfDateChangedLocked(now: date)
+            var line = formatter.format(record)
+            line.append("\n")
+            let data = Data(line.utf8)
             rotateIfNeeded(forAdditionalBytes: UInt64(data.count))
             do {
                 try fileHandle?.write(contentsOf: data)
@@ -192,7 +202,7 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
                     "write failed path=\(self.activeFileURL.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
                 )
             }
-            pruneIfNeeded(at: now(), force: false)
+            pruneIfNeeded(at: date, force: false)
         }
     }
 
@@ -256,6 +266,11 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         guard case .dateStamped(let granularity, let zone) = rotationPolicy else {
             return
         }
+        // The per-write fast path: two date comparisons. Outside the period
+        // (a new day, or the clock moved back) the name is computed again.
+        if let activePeriod, activePeriod.contains(now) {
+            return
+        }
         let target = Self.datedFileURL(
             logDirectory: logDirectory,
             processName: processName,
@@ -264,7 +279,9 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
             granularity: granularity,
             zone: zone
         )
+        let period = Self.datePeriod(containing: now, granularity: granularity, zone: zone)
         guard target.standardizedFileURL != activeFileURL.standardizedFileURL else {
+            activePeriod = period
             return
         }
 
@@ -277,6 +294,7 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
             currentSize = try handle.seekToEnd()
             fileHandle = handle
             activeFileURL = target
+            activePeriod = period
         } catch {
             degradationLogger.error(
                 "date roll open failed path=\(target.path, privacy: .public) error=\(String(describing: error), privacy: .public)"
@@ -490,6 +508,24 @@ public class FileDestination: LogDestination, FilterConfigObservable, @unchecked
         let stamp = dateStamp(for: date, granularity: granularity, zone: zone)
         let name = suffix.map { "\(processName)-\(stamp)-\($0)" } ?? "\(processName)-\(stamp)"
         return logDirectory.appendingPathComponent("\(name).log")
+    }
+
+    /// The dates whose `dateStamp` equals the stamp of `date`: the calendar day
+    /// in `zone` for `.day`.
+    static func datePeriod(
+        containing date: Date,
+        granularity: DateGranularity,
+        zone: TimeZone
+    ) -> Range<Date> {
+        switch granularity {
+        case .day:
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = zone
+            let start = calendar.startOfDay(for: date)
+            let end = calendar.date(byAdding: .day, value: 1, to: start)
+                ?? start.addingTimeInterval(24 * 60 * 60)
+            return start..<end
+        }
     }
 
     static func dateStamp(

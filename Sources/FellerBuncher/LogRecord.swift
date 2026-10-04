@@ -150,10 +150,31 @@ public struct LogRecord: Sendable {
     }
 
     static func sanitize(_ value: String) -> String {
-        String(
+        guard containsControlCharacter(value) else {
+            return value
+        }
+        return String(
             value.unicodeScalars.filter {
                 $0.properties.generalCategory != .control
             }
         )
+    }
+
+    /// `true` when `value` holds a control character (general category Cc:
+    /// U+0000–U+001F and U+007F–U+009F). A byte scan of the UTF-8, so clean
+    /// strings skip the scalar filter and its allocation.
+    private static func containsControlCharacter(_ value: String) -> Bool {
+        var previous: UInt8 = 0
+        for byte in value.utf8 {
+            if byte < 0x20 || byte == 0x7F {
+                return true
+            }
+            // U+0080–U+009F encode as 0xC2 0x80–0xC2 0x9F.
+            if previous == 0xC2, (0x80...0x9F).contains(byte) {
+                return true
+            }
+            previous = byte
+        }
+        return false
     }
 }
