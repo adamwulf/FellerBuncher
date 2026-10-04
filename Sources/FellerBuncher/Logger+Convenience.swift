@@ -179,7 +179,7 @@ private extension Logger {
         function: String,
         line: UInt
     ) {
-        guard level >= logLevel else {
+        guard fellerBuncherAccepts(level, category: .default) else {
             return
         }
         emitFellerBuncherLog(
@@ -202,18 +202,29 @@ private extension Logger {
         function: String,
         line: UInt
     ) {
-        guard level >= logLevel else {
+        let category = LogCategory(category)
+        guard fellerBuncherAccepts(level, category: category) else {
             return
         }
         emitFellerBuncherLog(
             level: level,
-            category: LogCategory(category),
+            category: category,
             message: message(),
             metadata: metadata,
             file: file,
             function: function,
             line: line
         )
+    }
+
+    /// The category-aware gate, checked before the message and metadata are
+    /// rendered. FellerBuncher's handlers answer it per category; any other
+    /// handler falls back to its `logLevel`.
+    func fellerBuncherAccepts(_ level: Logger.Level, category: LogCategory) -> Bool {
+        if let gating = handler as? any CategoryGatingLogHandler {
+            return gating.accepts(level, category: category)
+        }
+        return level >= logLevel
     }
 
     func emitFellerBuncherLog(

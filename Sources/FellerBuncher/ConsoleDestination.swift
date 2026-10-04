@@ -8,7 +8,7 @@ public enum ConsoleMode: Sendable, Equatable {
     case none
 }
 
-public final class ConsoleDestination: LogDestination, @unchecked Sendable {
+public final class ConsoleDestination: LogDestination, FilterConfigObservable, @unchecked Sendable {
     public let mode: ConsoleMode
     public let formatter: LogfmtFormatter
 
@@ -44,6 +44,13 @@ public final class ConsoleDestination: LogDestination, @unchecked Sendable {
 
     public func shouldLog(_ record: LogRecord) -> Bool {
         mode != .none && filter.get().shouldLog(record)
+    }
+
+    func setFilterConfigObserver(
+        _ observer: (@Sendable () -> Void)?,
+        for key: ObjectIdentifier
+    ) {
+        filter.setObserver(observer, for: key)
     }
 
     public func receive(_ record: LogRecord) {

@@ -94,9 +94,12 @@ public func bootstrap(
     case (.none, .none):
         destinations = [fileDestination]
     }
+    // With pre-config capture installed, every logger keeps the pre-config
+    // handler after bootstrap, so the registry rebuilds that handler's gate.
     let registry = DestinationRegistry(
         destinations: destinations,
-        globalLevel: minimumLevel
+        globalLevel: minimumLevel,
+        gate: bootstrapState.preConfigCoordinator?.gate ?? LevelGate()
     )
 
     let handle = LoggingHandle(

@@ -21,7 +21,7 @@ public enum PruneDate: Sendable, Equatable {
     case creationDate
 }
 
-public class FileDestination: LogDestination, @unchecked Sendable {
+public class FileDestination: LogDestination, FilterConfigObservable, @unchecked Sendable {
     public static let maxFileBytes: UInt64 = 10 * 1_024 * 1_024
     public static let rotatedFilesToKeep = 5
     public static let pruneInterval: TimeInterval = 60 * 60
@@ -152,6 +152,13 @@ public class FileDestination: LogDestination, @unchecked Sendable {
 
     public func shouldLog(_ record: LogRecord) -> Bool {
         filter.get().shouldLog(record)
+    }
+
+    func setFilterConfigObserver(
+        _ observer: (@Sendable () -> Void)?,
+        for key: ObjectIdentifier
+    ) {
+        filter.setObserver(observer, for: key)
     }
 
     public func receive(_ record: LogRecord) {

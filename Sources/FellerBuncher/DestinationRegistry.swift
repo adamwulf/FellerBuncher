@@ -5,48 +5,66 @@ public final class DestinationRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var destinations: [any LogDestination]
 
-    /// The global minimum level. It is the source of truth for the handler gate
-    /// and is mirrored into every destination's `FilterConfig` by `setGlobalLevel`.
+    /// Serializes the global-level writers (`setGlobalLevel` and the inherit
+    /// step of `addDestination`) and guards `levelObservers`.
     private let levelLock = NSLock()
-    private var globalLevelValue: Logger.Level
     private var levelObservers: [(Logger.Level) -> Void] = []
 
-    public init(
+    /// The global level and the per-category floors the handlers check before
+    /// they render anything. `bootstrap` shares it with the pre-config handler.
+    let gate: LevelGate
+
+    public convenience init(
         destinations: [any LogDestination] = [],
         globalLevel: Logger.Level = .info
     ) {
+        self.init(destinations: destinations, globalLevel: globalLevel, gate: LevelGate())
+    }
+
+    init(
+        destinations: [any LogDestination],
+        globalLevel: Logger.Level,
+        gate: LevelGate
+    ) {
         self.destinations = destinations
-        self.globalLevelValue = globalLevel
+        self.gate = gate
+        for destination in destinations {
+            observeFilterConfig(of: destination)
+        }
+        rebuildGate(globalLevel: globalLevel)
     }
 
-    /// The effective global minimum level (the handler gate).
+    /// The effective global minimum level.
     public func globalLevel() -> Logger.Level {
-        levelLock.lock()
-        defer { levelLock.unlock() }
-        return globalLevelValue
+        gate.globalLevel()
     }
 
-    /// Writes `level` into the global gate **and** into every destination's
-    /// `FilterConfig`, then notifies observers on the calling thread. The gate
-    /// write and the per-destination fan-out happen under `levelLock` as one
-    /// unit, so two concurrent setters can't leave a durable gate-vs-destination
-    /// mismatch. A destination added afterward inherits the level via
-    /// `addDestination` (also under `levelLock`).
+    /// Writes `level` into the gate **and** into the `FilterConfig` of every
+    /// destination that follows the global level, then notifies observers on
+    /// the calling thread. A destination whose config has
+    /// `followsGlobalLevel == false` keeps its own level. The gate write and
+    /// the per-destination fan-out happen under `levelLock` as one unit, so two
+    /// concurrent setters can't leave a durable gate-vs-destination mismatch. A
+    /// destination added afterward inherits the level via `addDestination`
+    /// (also under `levelLock`).
     ///
-    /// Lock-ordering: `levelLock` is held while calling `snapshot()` (the
-    /// registry `lock`) and `setFilterConfig` (the per-destination filter lock).
-    /// Neither of those re-enters `levelLock`, and no path acquires `lock`
-    /// before `levelLock`, so the nesting introduces no cycle.
+    /// Lock-ordering: `levelLock` is held while rebuilding the gate (its own
+    /// locks, then `snapshot()` and each destination's filter lock) and while
+    /// calling `setFilterConfig`. None of those re-enters `levelLock`, so the
+    /// nesting introduces no cycle.
     public func setGlobalLevel(_ level: Logger.Level) {
         let observers: [(Logger.Level) -> Void]
         let changed: Bool
 
         levelLock.lock()
-        changed = globalLevelValue != level
-        globalLevelValue = level
+        changed = gate.globalLevel() != level
         observers = levelObservers
+        rebuildGate(globalLevel: level)
         for destination in snapshot() {
             var config = destination.filterConfig()
+            guard config.followsGlobalLevel else {
+                continue
+            }
             config.minimumLevel = level
             destination.setFilterConfig(config)
         }
@@ -66,9 +84,11 @@ public final class DestinationRegistry: @unchecked Sendable {
         levelLock.lock()
         defer { levelLock.unlock() }
         levelObservers.append(observer)
-        return globalLevelValue
+        return gate.globalLevel()
     }
 
+    /// Adds `destination`. If its config follows the global level, it inherits
+    /// the current global level; otherwise it keeps its own.
     public func addDestination(_ destination: any LogDestination) {
         let identifier = ObjectIdentifier(destination)
         lock.lock()
@@ -82,13 +102,17 @@ public final class DestinationRegistry: @unchecked Sendable {
         guard !alreadyRegistered else {
             return
         }
+        observeFilterConfig(of: destination)
 
         // Inherit the global level under `levelLock` so this can't race a
         // concurrent `setGlobalLevel` into a lost update on the new destination.
         levelLock.lock()
         var config = destination.filterConfig()
-        config.minimumLevel = globalLevelValue
-        destination.setFilterConfig(config)
+        if config.followsGlobalLevel {
+            config.minimumLevel = gate.globalLevel()
+            destination.setFilterConfig(config)
+        }
+        rebuildGate()
         levelLock.unlock()
     }
 
@@ -113,10 +137,22 @@ public final class DestinationRegistry: @unchecked Sendable {
             completion()
             return
         }
+        (removed as? FilterConfigObservable)?.setFilterConfigObserver(
+            nil,
+            for: ObjectIdentifier(self)
+        )
+        rebuildGate()
         // tearDown runs drain+close on the destination's own serial queue, so
         // every prior `receive` is flushed (FIFO) before the close — this is the
         // "drain before teardown" the plan calls for, satisfied by queue order.
         removed.tearDown(completion: completion)
+    }
+
+    /// Rebuilds the level gate from every destination's current filter config.
+    /// The built-in destinations report their own `setFilterConfig` calls; call
+    /// this after changing the config of a registered custom destination.
+    public func filterConfigDidChange() {
+        rebuildGate()
     }
 
     public func snapshot() -> [any LogDestination] {
@@ -132,15 +168,18 @@ public final class DestinationRegistry: @unchecked Sendable {
         }
     }
 
-    func hasForceIncludedCategories() -> Bool {
-        snapshot().contains {
-            !$0.filterConfig().forceInclude.isEmpty
+    private func rebuildGate(globalLevel: Logger.Level? = nil) {
+        gate.rebuild(globalLevel: globalLevel) {
+            snapshot()
         }
     }
 
-    func forceIncludes(_ category: LogCategory) -> Bool {
-        snapshot().contains {
-            $0.filterConfig().forceInclude.contains(category)
-        }
+    private func observeFilterConfig(of destination: any LogDestination) {
+        (destination as? FilterConfigObservable)?.setFilterConfigObserver(
+            { [weak self] in
+                self?.rebuildGate()
+            },
+            for: ObjectIdentifier(self)
+        )
     }
 }
