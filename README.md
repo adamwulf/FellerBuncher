@@ -46,7 +46,9 @@ import FellerBuncher
 import Logging
 
 // 1. Pick a directory for the log files (the package stays path-agnostic).
-let logDir = URL.documentsDirectory.appending(path: "Logs")
+let logDir = try FileManager.default
+    .url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    .appendingPathComponent("Logs")
 
 // 2. Bootstrap once. Sane defaults: OSLog console echo, .info level,
 //    10 MB size-based rotation, keep 5 files, 7-day retention.
@@ -69,7 +71,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         do {
             _ = try bootstrap(
                 processName: "MyApp",
-                logDir: URL.documentsDirectory.appending(path: "Logs")
+                logDir: FileManager.default
+                    .url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                    .appendingPathComponent("Logs")
             )
         } catch {
             // The default OSLog console still works even if the file dir failed.
@@ -88,7 +92,9 @@ struct MyApp: App {
     init() {
         _ = try? bootstrap(
             processName: "MyApp",
-            logDir: URL.documentsDirectory.appending(path: "Logs")
+            logDir: FileManager.default
+                .url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                .appendingPathComponent("Logs")
         )
     }
 
