@@ -22,13 +22,7 @@ enum FellerBuncherBridge {
     }
 }
 
-/// A handler that answers the category-aware gate, so the sugar can drop a
-/// call before it renders the metadata.
-protocol CategoryGatingLogHandler {
-    func accepts(_ level: Logger.Level, category: LogCategory) -> Bool
-}
-
-public struct FellerBuncherLogHandler: LogHandler, CategoryGatingLogHandler {
+public struct FellerBuncherLogHandler: LogHandler {
     public var metadataProvider: Logger.MetadataProvider?
     public var metadata: Logger.Metadata
     public var logLevel: Logger.Level {

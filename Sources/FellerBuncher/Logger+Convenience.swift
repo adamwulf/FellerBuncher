@@ -219,10 +219,16 @@ private extension Logger {
 
     /// The category-aware gate, checked before the message and metadata are
     /// rendered. FellerBuncher's handlers answer it per category; any other
-    /// handler falls back to its `logLevel`.
+    /// handler falls back to its `logLevel`. Casts to the concrete handler
+    /// types: a cast to a protocol existential boxes the handler on every
+    /// call and doubled the cost of a dropped call.
     func fellerBuncherAccepts(_ level: Logger.Level, category: LogCategory) -> Bool {
-        if let gating = handler as? any CategoryGatingLogHandler {
-            return gating.accepts(level, category: category)
+        let handler = self.handler
+        if let preConfig = handler as? PreConfigLogHandler {
+            return preConfig.accepts(level, category: category)
+        }
+        if let live = handler as? FellerBuncherLogHandler {
+            return live.accepts(level, category: category)
         }
         return level >= logLevel
     }

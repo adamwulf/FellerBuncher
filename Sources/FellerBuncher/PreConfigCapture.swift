@@ -98,7 +98,7 @@ final class PreConfigCoordinator: @unchecked Sendable {
 /// The `LogHandler` installed by `installPreConfigCapture`. A value type that
 /// holds a reference to the shared coordinator, so every logger copy routes to
 /// the same buffer/registry.
-public struct PreConfigLogHandler: LogHandler, CategoryGatingLogHandler {
+public struct PreConfigLogHandler: LogHandler {
     public var metadataProvider: Logger.MetadataProvider?
     public var metadata: Logger.Metadata = [:]
     public var logLevel: Logger.Level {
