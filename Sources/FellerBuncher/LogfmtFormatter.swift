@@ -135,7 +135,7 @@ public struct LogfmtFormatter: Sendable {
             timeSeparator: .colon,
             timeZoneSeparator: .omitted,
             includingFractionalSeconds: true,
-            timeZone: .gmt
+            timeZone: .fellerBuncherUTC
         )
         let formatted = iso8601.format(roundedToMilliseconds)
         if style == .utcSpaceSeparated {

@@ -12,7 +12,7 @@ stock `Logger(label:)`. FellerBuncher only owns the bootstrap and the
 destination fan-out, so there is no facade to learn and nothing to migrate away
 from later.
 
-- **Platforms:** iOS 16+, macOS 13+ (incl. Mac Catalyst), tvOS 16+, watchOS 9+
+- **Platforms:** iOS 15+, macOS 12+ (incl. Mac Catalyst), tvOS 15+, watchOS 8+
 - **Concurrency:** Swift 6 language mode, full strict concurrency. The public
   surface is synchronous (no `async`/`await` required).
 
